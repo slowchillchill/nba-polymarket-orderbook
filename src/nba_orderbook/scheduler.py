@@ -6,10 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 import uuid
+from datetime import timedelta
+import requests
 from contextlib import contextmanager
 from .model import Game, dt, iso, now, group_games, peak_concurrency
 from .collector import write_json
-from .kaggle import SubmissionNotAttempted, SubmissionRejected
+from .kaggle import SubmissionNotAttempted, SubmissionRejected, FINAL_FILES, retry_after_seconds
 
 ACTIVE={'QUEUED','RUNNING','CANCEL_REQUESTED'}
 TERMINAL={'COMPLETE','ERROR','CANCEL_ACKNOWLEDGED','CANCELLED'}
@@ -59,11 +61,78 @@ def update_registered_sessions(backend,state):
             registered[(batch['ref'],batch['version'])]={'ref':batch['ref'],'version':batch['version']}
     backend.known_sessions=list(registered.values())
 
+class PublicationPolling:
+    """只查询可能已发布的比赛，并保存经过核对的固定最终版本。"""
+    def __init__(self,config,backend,store,state):
+        self.config,self.backend,self.store,self.state=config,backend,store,state
+        self.checked=set()
+        self.unconfirmed=set()
+        limit=state.get('publication_rate_limit')
+        self.blocked=bool(limit and now()<dt(limit['retry_at']))
+
+    def rate_limited(self,error):
+        if not isinstance(error,requests.HTTPError) or error.response is None or error.response.status_code!=429:
+            return False
+        at=now()
+        raw=error.response.headers.get('Retry-After')
+        retry_at=at.replace(minute=(at.minute//30)*30,second=0,microsecond=0)+timedelta(minutes=30)
+        retry_at=at+timedelta(seconds=retry_after_seconds(error,at,(retry_at-at).total_seconds()))
+        self.state['publication_rate_limit']={'observed_at':iso(at),'retry_after':raw,'retry_at':iso(retry_at)}
+        self.blocked=True
+        self.store.save(self.state)
+        return True
+
+    def probe(self,row):
+        if row.get('publication'):
+            return row['publication']
+        game=row['game'];gid=game['game_id']
+        if self.blocked or gid in self.checked:
+            return None
+        batch=self.state['batches'].get(row.get('batch_id'))
+        if not batch or batch['state'] not in ('submitting','submission_unknown','submitted','ended'):
+            return None
+        expected=next((g for g in batch.get('games',[]) if g['game_id']==gid),game)
+        ref=f"{self.config['owner']}/{expected['slug']}"
+        self.checked.add(gid)
+        try:
+            published=self.backend.inspect_dataset(ref)
+            if not published:
+                self.state.pop('publication_rate_limit',None)
+                return None
+            self.unconfirmed.add(gid)
+            if published.get('status','').lower()!='ready' or not set(FINAL_FILES).issubset(published.get('files',[])) or not published.get('summary'):
+                self.state.pop('publication_rate_limit',None)
+                return None
+            summary=published['summary']
+            metadata=self.backend.read_json(ref,'metadata.json',published['version'])
+            consistent=(metadata.get('slug')==summary.get('slug')==expected['slug']
+                        and metadata.get('condition_id')==summary.get('condition_id')==expected['condition_id']
+                        and metadata.get('game_id')==expected['game_id']
+                        and metadata.get('assets')==expected['assets']
+                        and bool(metadata.get('start'))
+                        and (not summary.get('game_start') or dt(metadata['start'])==dt(summary['game_start'])))
+            if not consistent:
+                row['publication_error']='metadata_summary_mismatch'
+                self.state.pop('publication_rate_limit',None)
+                return None
+            row['publication']={'slug':metadata['slug'],'game_start':metadata['start'],'dataset':ref,
+                                'final_version':published['version'],'stop_reason':summary['stop_reason'],'quality':summary['quality']}
+            row.pop('publication_error',None)
+            self.state.pop('publication_rate_limit',None)
+            # 在下一次远端请求或目录写入前保存已确认的发布事实。
+            self.store.save(self.state)
+            return row['publication']
+        except requests.HTTPError as error:
+            if self.rate_limited(error):
+                return None
+            raise
+
 async def scan(config,backend,api,timers=None):
     timers=timers or Timers()
     store=Store(config['state_dir'])
     games,anomalies=await api.discover()
     with store.locked() as state:
+        publications=PublicationPolling(config,backend,store,state)
         retry_batches={bid:b for bid,b in state['batches'].items() if b['state'] in ('planned','invalidated') and b.get('error') in (SubmissionNotAttempted.__name__,SubmissionRejected.__name__)}
         state['anomalies']=anomalies
         ambiguous={str(a['game_id']) for a in anomalies if a.get('reason')=='multiple_moneylines'}
@@ -85,13 +154,14 @@ async def scan(config,backend,api,timers=None):
                 game.postponed_with_time=previous.postponed_with_time
                 old['game']=game.to_dict()
                 old['waiting_schedule']=game.status.lower()=='postponed' and not game.postponed_with_time
+                if old.get('publication'):
+                    continue
                 if old.get('batch_id') in retry_batches:
                     continue
             if old and old.get('batch_id') and state['batches'][old['batch_id']]['state'] not in ('planned','ended','missed_window'):
                 continue
             if old and old.get('batch_id') and state['batches'][old['batch_id']]['state']=='ended':
-                published=backend.inspect_dataset(f"{config['owner']}/{game.slug}")
-                if published and published.get('status','').lower()=='ready' and published.get('summary'):
+                if publications.probe(old) or publications.blocked or game.game_id in publications.unconfirmed:
                     continue
             postponed=game.status.lower()=='postponed' and not game.postponed_with_time
             state['games'][game.game_id]={'game':game.to_dict(),'batch_id':None,'waiting_schedule':postponed,'ambiguous_market':game.game_id in ambiguous}
@@ -195,15 +265,19 @@ async def scan(config,backend,api,timers=None):
         update_registered_sessions(backend,state)
         rows=[]
         for row in state['games'].values():
-            game=row['game']; ref=f"{config['owner']}/{game['slug']}"
-            published=backend.inspect_dataset(ref)
-            if published and published.get('status','').lower()=='ready' and published.get('summary'):
-                metadata=backend.read_json(ref,'metadata.json',published['version'])
-                rows.append({'slug':game['slug'],'game_start':metadata['start'],'dataset':ref,
-                             'final_version':published['version'],'stop_reason':published.get('summary',{}).get('stop_reason'),
-                             'quality':published.get('summary',{}).get('quality')})
-        if rows:
-            backend.catalog(rows,store.path/'catalog')
+            published=publications.probe(row)
+            if published:
+                rows.append(published)
+            if publications.blocked:
+                break
+        if rows and not publications.blocked:
+            store.save(state)
+            try:
+                backend.catalog(rows,store.path/'catalog')
+                state.pop('publication_rate_limit',None)
+            except requests.HTTPError as error:
+                if not publications.rate_limited(error):
+                    raise
         state['last_scan']=iso(now())
     return state
 

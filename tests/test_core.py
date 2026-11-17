@@ -251,8 +251,8 @@ async def test_active_schedule_updates_but_catalog_uses_final_published_time(tmp
     class API:
         async def discover(self):return [changed],[]
     class Backend(SchedulerBackend):
-        def inspect_dataset(self,ref):return {'status':'READY','version':1,'summary':{'stop_reason':'market_resolved','quality':'partial'}}
-        def read_json(self,ref,name,version):assert name=='metadata.json';return {'start':final}
+        def inspect_dataset(self,ref):return {'status':'READY','version':1,'files':['orderbook.jsonl','metadata.json','summary.json'],'summary':{'slug':old.slug,'condition_id':old.condition_id,'game_start':final,'stop_reason':'market_resolved','quality':'partial'}}
+        def read_json(self,ref,name,version):assert name=='metadata.json';return {**old.to_dict(),'start':final}
     backend=Backend();timers=FakeTimers()
     state=await scan({'state_dir':str(tmp_path),'owner':'qa','_path':'unused'},backend,API(),timers)
     assert state['games']['1']['game']['start']==changed.start
@@ -850,3 +850,286 @@ async def test_due_capacity_failure_does_not_lose_other_future_group_timer(tmp_p
     assert state['batches'][due_bid]['state']=='planned' and future_bid in timers.active
     restored=submit(config,backend,due_bid)
     assert restored['state']=='submitted' and 'capacity_error' not in restored and backend.writes==1
+
+
+async def test_fifty_three_unsubmitted_future_games_schedule_fifteen_batches_without_dataset_calls(tmp_path):
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    games=[]
+    start=now()+timedelta(hours=3)
+    for group in range(15):
+        for member in range(11 if group==14 else 3):
+            g=game(iso(start+timedelta(hours=3*group,minutes=10*member)),str(len(games)))
+            g.slug='nba-future-'+g.game_id;games.append(g)
+    class API:
+        async def discover(self):return games,[]
+    class Backend(SchedulerBackend):
+        def inspect_dataset(self,ref):raise AssertionError('unsubmitted future game must not query Dataset')
+        def catalog(self,*args):raise AssertionError('no publication to add')
+    timers=TrackingTimers()
+    state=await scan({'state_dir':str(tmp_path),'owner':'qa','_path':'unused'},Backend(),API(),timers)
+    assert len(state['games'])==53 and len(timers.active)==15
+    assert sum(b['state']=='planned' for b in state['batches'].values())==15
+
+class PublicationBackend(SchedulerBackend):
+    def __init__(self,games):
+        super().__init__();self.games={g.slug:g for g in games};self.inspects=[];self.metadata_reads=[];self.catalog_calls=[]
+    def inspect_dataset(self,ref):
+        self.inspects.append(ref);g=self.games[ref.split('/',1)[1]]
+        return {'status':'READY','version':1,'files':['orderbook.jsonl','metadata.json','summary.json'],
+                'summary':{'slug':g.slug,'condition_id':g.condition_id,'game_start':g.start,'stop_reason':'market_resolved','quality':'partial'}}
+    def read_json(self,ref,name,version):
+        self.metadata_reads.append((ref,name,version));return self.games[ref.split('/',1)[1]].to_dict()
+    def catalog(self,rows,directory):self.catalog_calls.append(rows);return {'changed':True}
+
+def publication_state(path,games,status='ended'):
+    from nba_orderbook.scheduler import Store
+    state={'games':{},'batches':{},'anomalies':[]}
+    for g in games:
+        bid='batch-'+g.game_id
+        state['games'][g.game_id]={'game':g.to_dict(),'batch_id':bid}
+        state['batches'][bid]={'id':bid,'state':status,'games':[g.to_dict()],'ref':'qa/nba-'+bid,'version':1}
+    Store(path).save(state)
+
+async def test_final_publication_is_probed_once_and_cached_across_scans_with_published_time(tmp_path):
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    g=game(iso(now()+timedelta(hours=3)))
+    publication_state(tmp_path,[g])
+    final=Game.from_dict(g.to_dict());final.start=iso(dt(g.start)+timedelta(hours=1))
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict())],[]
+    backend=PublicationBackend([final]);config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scan(config,backend,API(),TrackingTimers())
+    assert backend.inspects==['qa/'+g.slug] and len(backend.metadata_reads)==1
+    assert first['games'][g.game_id]['publication']['game_start']==final.start
+    assert backend.catalog_calls[0][0]['final_version']==1
+    # 新适配器和重新读取的旧运行状态也复用固定最终版本，不重复探测历史Dataset。
+    second_backend=PublicationBackend([final])
+    second=await scan(config,second_backend,API(),TrackingTimers())
+    assert second_backend.inspects==[] and second_backend.metadata_reads==[]
+    assert second_backend.catalog_calls[0][0]['game_start']==final.start
+    assert second['games'][g.game_id]['publication']==first['games'][g.game_id]['publication']
+
+async def test_absence_processing_or_inconsistent_files_are_not_cached(tmp_path):
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    class API:
+        async def discover(self):return [],[]
+    g=game(iso(now()+timedelta(hours=3)))
+    for mode in ('absent','processing','missing_file','wrong_identity','wrong_time'):
+        path=tmp_path/mode;publication_state(path,[g])
+        class Backend(PublicationBackend):
+            def inspect_dataset(self,ref):
+                result=super().inspect_dataset(ref)
+                if mode=='absent':return None
+                if mode=='processing':result['status']='PROCESSING'
+                if mode=='missing_file':result['files'].remove('orderbook.jsonl')
+                if mode=='wrong_identity':result['summary']['condition_id']='other'
+                if mode=='wrong_time':result['summary']['game_start']=iso(dt(g.start)+timedelta(hours=1))
+                return result
+        backend=Backend([g]);config={'state_dir':str(path),'owner':'qa','_path':'unused'}
+        for _ in range(2):
+            state=await scan(config,backend,API(),TrackingTimers())
+            assert not state['games'][g.game_id].get('publication')
+        assert len(backend.inspects)==2 and backend.catalog_calls==[]
+
+async def test_rate_limit_stops_remaining_publication_queries_and_respects_retry_after(monkeypatch,tmp_path):
+    import requests
+    from nba_orderbook import scheduler
+    from nba_orderbook.model import now,iso
+    clock=[now()];monkeypatch.setattr(scheduler,'now',lambda:clock[0])
+    games=[game(iso(clock[0]+timedelta(hours=3)),str(i)) for i in range(3)]
+    for g in games:g.slug='nba-published-'+g.game_id
+    publication_state(tmp_path,games)
+    class API:
+        async def discover(self):return [],[]
+    class Backend(PublicationBackend):
+        throttle=True
+        def inspect_dataset(self,ref):
+            if ref.endswith('-1') and self.throttle:
+                self.inspects.append(ref)
+                response=requests.Response();response.status_code=429;response.headers['Retry-After']='3600'
+                raise requests.HTTPError('rate limited',response=response)
+            return super().inspect_dataset(ref)
+    backend=Backend(games);config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert backend.inspects==['qa/nba-published-0','qa/nba-published-1']
+    assert backend.catalog_calls==[] and first['games']['0']['publication']['final_version']==1
+    assert not first['games']['1'].get('publication') and not first['games']['2'].get('publication')
+    persisted=json.loads((tmp_path/'state.json').read_text())
+    assert persisted['publication_rate_limit']['retry_after']=='3600'
+    clock[0]+=timedelta(minutes=30)
+    await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert len(backend.inspects)==2 and backend.catalog_calls==[]
+    clock[0]+=timedelta(minutes=30);backend.throttle=False
+    recovered=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert backend.inspects==['qa/nba-published-0','qa/nba-published-1','qa/nba-published-1','qa/nba-published-2']
+    assert len(backend.catalog_calls)==1 and len(backend.catalog_calls[0])==3
+    assert 'publication_rate_limit' not in recovered
+
+async def test_verified_publication_is_durable_before_catalog_failure(tmp_path):
+    import pytest
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    g=game(iso(now()+timedelta(hours=3)));publication_state(tmp_path,[g])
+    class API:
+        async def discover(self):return [],[]
+    class Backend(PublicationBackend):
+        def catalog(self,*args):raise RuntimeError('catalog transport failed')
+    backend=Backend([g]);config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    with pytest.raises(RuntimeError):await scan(config,backend,API(),TrackingTimers())
+    assert json.loads((tmp_path/'state.json').read_text())['games'][g.game_id]['publication']['final_version']==1
+    recovered=PublicationBackend([g])
+    await scan(config,recovered,API(),TrackingTimers())
+    assert recovered.inspects==[] and recovered.metadata_reads==[]
+
+async def test_catalog_429_preserves_verified_cache_and_honors_http_date_retry_after(monkeypatch,tmp_path):
+    import requests
+    from nba_orderbook import scheduler
+    from nba_orderbook.model import iso
+    clock=[dt('2026-11-17T11:00:00Z')];monkeypatch.setattr(scheduler,'now',lambda:clock[0])
+    g=game(iso(clock[0]+timedelta(hours=3)));publication_state(tmp_path,[g])
+    class API:
+        async def discover(self):return [],[]
+    class Backend(PublicationBackend):
+        throttle=True
+        def catalog(self,rows,directory):
+            self.catalog_calls.append(rows)
+            if self.throttle:
+                response=requests.Response();response.status_code=429
+                response.headers['Retry-After']='Tue, 17 Nov 2026 12:00:00 GMT'
+                raise requests.HTTPError('catalog rate limited',response=response)
+    backend=Backend([g]);config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert first['games'][g.game_id]['publication']['final_version']==1
+    assert dt(first['publication_rate_limit']['retry_at'])==dt('2026-11-17T12:00:00Z')
+    clock[0]+=timedelta(minutes=30)
+    await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert len(backend.inspects)==1 and len(backend.catalog_calls)==1
+    clock[0]+=timedelta(minutes=30);backend.throttle=False
+    recovered=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert len(backend.inspects)==1 and len(backend.catalog_calls)==2
+    assert 'publication_rate_limit' not in recovered
+
+async def test_real_backend_pending_catalog_429_stops_immediately_and_recovers_after_wait(monkeypatch,tmp_path):
+    import requests
+    from types import SimpleNamespace as N
+    from unittest.mock import Mock
+    from nba_orderbook import scheduler
+    from nba_orderbook.kaggle import Backend
+    from nba_orderbook.model import iso
+    clock=[dt('2026-11-17T11:00:00Z')];monkeypatch.setattr(scheduler,'now',lambda:clock[0])
+    g=game(iso(clock[0]-timedelta(hours=12)))
+    row={'slug':g.slug,'game_start':g.start,'dataset':'qa/'+g.slug,'final_version':1,'stop_reason':'market_resolved','quality':'partial'}
+    scheduler.Store(tmp_path).save({'games':{'1':{'game':g.to_dict(),'publication':row}},'batches':{},'anomalies':[]})
+    directory=tmp_path/'catalog';directory.mkdir()
+    ref='qa/nba-polymarket-orderbook';marker=directory/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref,'version':2,'status':'pending'}))
+    response=requests.Response();response.status_code=429;response.headers['Retry-After']='3600'
+    error=requests.HTTPError('rate limit in real Backend.catalog pending wait',response=response)
+    ready={'ref':ref,'version':2,'status':'READY','files':['catalog.json']}
+    api=Mock();backend=Backend('qa',client=N(datasets=N(dataset_api_client=api)),ready_timeout=30,poll_seconds=10)
+    backend.list_active=Mock(return_value=[])
+    backend.inspect_dataset=Mock(side_effect=[error,ready,ready])
+    backend.read_json=Mock(return_value=[row]);backend._upload=Mock()
+    sleep=Mock();monkeypatch.setattr('nba_orderbook.kaggle.time.sleep',sleep)
+    class API:
+        async def discover(self):return [],[]
+    config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert backend.inspect_dataset.call_count==1 and sleep.call_count==0
+    assert first['publication_rate_limit']['retry_after']=='3600'
+    assert first['games']['1']['publication']==row
+    assert json.loads(marker.read_text())=={'ref':ref,'version':2,'status':'pending'}
+    assert json.loads((tmp_path/'state.json').read_text())['publication_rate_limit']['retry_after']=='3600'
+    clock[0]+=timedelta(minutes=30)
+    await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert backend.inspect_dataset.call_count==1
+    clock[0]+=timedelta(minutes=30)
+    recovered=await scheduler.scan(config,backend,API(),TrackingTimers())
+    assert backend.inspect_dataset.call_count==3 and sleep.call_count==0
+    assert 'publication_rate_limit' not in recovered
+    assert json.loads(marker.read_text())['status']=='ready'
+    api.create_dataset.assert_not_called();api.create_dataset_version.assert_not_called();backend._upload.assert_not_called()
+
+async def test_collector_waits_for_429_without_blocking_other_game_and_reconciles_pending(monkeypatch,tmp_path):
+    import requests,threading
+    from types import SimpleNamespace as N
+    from unittest.mock import Mock
+    from nba_orderbook import collector
+    from nba_orderbook.kaggle import Backend,FINAL_FILES
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    from nba_orderbook.model import now,iso
+    original_sleep=asyncio.sleep
+    clock=[now()];monkeypatch.setattr(collector,'now',lambda:clock[0])
+    monkeypatch.setenv('KAGGLE_KERNEL_RUN_TYPE','Batch')
+    rejected=threading.Event();progress=[];waits=[]
+    a=game(iso(clock[0]+timedelta(hours=2)),'A');a.slug='nba-a'
+    b=game(a.start,'B');b.slug='nba-b'
+    async def run(self):
+        self.directory.mkdir(parents=True,exist_ok=True)
+        with gzip.open(self.directory/'orderbook.jsonl.gz','wt') as stream:stream.write('{}\n')
+        (self.directory/'metadata.json').write_text(json.dumps(self.game.to_dict()))
+        (self.directory/'summary.json').write_text(json.dumps({'stop_reason':'qa_timeout'}))
+        if self.game.game_id=='B':
+            while not rejected.is_set():await original_sleep(.001)
+            progress.append('B continued while A waited')
+        return {'stop_reason':'qa_timeout'}
+    monkeypatch.setattr(collector.Collection,'run',run)
+    async def sports(*args):await asyncio.Event().wait()
+    monkeypatch.setattr(collector,'sports_updates',sports)
+    async def wait(delay):
+        waits.append(delay)
+        while not progress:await original_sleep(.001)
+        clock[0]+=timedelta(seconds=delay)
+    monkeypatch.setattr(collector.asyncio,'sleep',wait)
+    response=requests.Response();response.status_code=429;response.headers['Retry-After']='5'
+    error=requests.HTTPError('create result unknown after 429',response=response)
+    api=Mock()
+    def create(request):
+        assert api.create_dataset.call_count==1,'pending creation must not be repeated'
+        rejected.set();raise error
+    api.create_dataset.side_effect=create
+    backend=Backend('qa',client=N(datasets=N(dataset_api_client=api)))
+    backend._upload=Mock(return_value=ApiDatasetNewFile())
+    backend.inspect_dataset=Mock(side_effect=lambda ref:None if api.create_dataset.call_count==0 else {'ref':ref,'version':1,'status':'READY','files':list(FINAL_FILES)})
+    publish=backend.publish
+    def publish_game(directory,ref,**kwargs):
+        return {'status':'READY','version':1} if ref.endswith('nba-b') else publish(directory,ref,**kwargs)
+    backend.publish=publish_game
+    class API:
+        async def close(self):pass
+    results=await collector.collect_batch({'games':[a.to_dict(),b.to_dict()],'owner':'qa','qa_seconds':1,'runtime_seconds':100},tmp_path,backend,API())
+    assert waits==[5] and progress==['B continued while A waited']
+    assert len(results)==2 and api.create_dataset.call_count==1
+    assert backend._upload.call_count==3
+    assert json.loads((tmp_path/a.slug/'.publish-state.json').read_text())['status']=='ready'
+
+async def test_collector_rate_limit_wait_never_extends_instance_budget(monkeypatch,tmp_path):
+    import requests,pytest
+    from nba_orderbook import collector
+    from nba_orderbook.model import now,iso
+    monkeypatch.setenv('KAGGLE_KERNEL_RUN_TYPE','Batch')
+    original_sleep=asyncio.sleep
+    for after,expire_while_waiting in (('600',False),('5',True)):
+        clock=[now()];monkeypatch.setattr(collector,'now',lambda:clock[0]);waits=[]
+        g=game(iso(clock[0]+timedelta(hours=2)))
+        async def run(self):return {'stop_reason':'qa_timeout'}
+        monkeypatch.setattr(collector.Collection,'run',run)
+        async def sports(*args):await asyncio.Event().wait()
+        monkeypatch.setattr(collector,'sports_updates',sports)
+        async def wait(delay):waits.append(delay);clock[0]+=timedelta(seconds=11)
+        monkeypatch.setattr(collector.asyncio,'sleep',wait)
+        class Backend:
+            calls=0
+            def publish(self,*args,**kwargs):
+                self.calls+=1;response=requests.Response();response.status_code=429;response.headers['Retry-After']=after
+                raise requests.HTTPError('final publication throttled',response=response)
+        class API:
+            async def close(self):pass
+        directory=tmp_path/after;directory.mkdir();backend=Backend()
+        with pytest.raises(RuntimeError,match='batch_has_failed_games_or_publications'):
+            await collector.collect_batch({'games':[g.to_dict()],'owner':'qa','qa_seconds':1,'runtime_seconds':10},directory,backend,API())
+        assert backend.calls==1 and waits==([5] if expire_while_waiting else [])
+        assert json.loads((directory/'batch-results.json').read_text())==[{'error':'HTTPError'}]
