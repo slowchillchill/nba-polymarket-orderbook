@@ -612,3 +612,73 @@ async def test_prewrite_retry_is_regrouped_before_save_after_game_moves_beyond_t
     assigned=third['games']['B']['batch_id']
     assert third['batches'][assigned]['state']=='planned' and assigned in timers.scheduled
     assert third['required_peak_notebooks']==2 and len(backend.attempts)==2
+
+async def test_deleted_ended_notebook_does_not_block_future_planning(tmp_path):
+    from nba_orderbook.scheduler import scan,Store
+    from nba_orderbook.model import now,iso
+    future=game(iso(now()+timedelta(hours=3)),'future')
+    Store(tmp_path).save({'games':{},'batches':{'old':{'id':'old','state':'ended','ref':'qa/deleted','version':1}},'anomalies':[]})
+    class API:
+        async def discover(self):return [future],[]
+    class Backend(SchedulerBackend):
+        def __init__(self):super().__init__();self.known_sessions=[{'ref':'qa/deleted','version':1}]
+        def list_active(self):
+            assert {'ref':'qa/deleted','version':1} not in self.known_sessions
+            return []
+    backend=Backend();timers=FakeTimers()
+    state=await scan({'state_dir':str(tmp_path),'owner':'qa','_path':'unused'},backend,API(),timers)
+    bid=state['games']['future']['batch_id']
+    assert state['batches'][bid]['state']=='planned' and bid in timers.scheduled
+    assert backend.known_sessions==[]
+
+async def test_active_and_unknown_notebook_lookup_errors_are_not_free_capacity(tmp_path):
+    import pytest,requests
+    from nba_orderbook.scheduler import scan,Store
+    from nba_orderbook.model import now,iso
+    future=game(iso(now()+timedelta(hours=3)),'future')
+    old=game(iso(now()+timedelta(minutes=30)),'old')
+    class API:
+        async def discover(self):return [future],[]
+    for status in ('submitted','submission_unknown'):
+        path=tmp_path/status
+        Store(path).save({'games':{},'batches':{'old':{'id':'old','state':status,'ref':'qa/unconfirmed','version':1,'games':[old.to_dict()]}},'anomalies':[]})
+        class Backend(SchedulerBackend):
+            def list_active(self):
+                assert {'ref':'qa/unconfirmed','version':1} in self.known_sessions
+                response=requests.Response();response.status_code=403
+                raise requests.HTTPError('cannot verify registered version',response=response)
+        backend=Backend();timers=FakeTimers()
+        with pytest.raises(requests.HTTPError):
+            await scan({'state_dir':str(path),'owner':'qa','_path':'unused'},backend,API(),timers)
+        assert timers.scheduled==[]
+        assert {'ref':'qa/unconfirmed','version':1} in backend.known_sessions
+
+async def test_reused_backend_removes_version_only_after_terminal_confirmation(tmp_path):
+    from nba_orderbook.scheduler import scan,Store
+    from nba_orderbook.model import now,iso
+    old=game(iso(now()+timedelta(minutes=30)),'old')
+    Store(tmp_path).save({'games':{},'batches':{'old':{'id':'old','state':'submitted','ref':'qa/old','version':1,'games':[old.to_dict()]}},'anomalies':[]})
+    class API:
+        async def discover(self):return [],[]
+    class Backend(SchedulerBackend):
+        terminal=False;deleted=False
+        def __init__(self):
+            super().__init__();self.known_sessions=[{'ref':'qa/old','version':1},{'ref':'qa/other-project','version':7}]
+        def list_active(self):
+            if self.deleted:assert {'ref':'qa/old','version':1} not in self.known_sessions
+            else:assert {'ref':'qa/old','version':1} in self.known_sessions
+            assert {'ref':'qa/other-project','version':7} in self.known_sessions
+            return []
+        def snapshot(self,*args):return {'status':'COMPLETE' if self.terminal else 'RUNNING','version':1}
+    backend=Backend();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scan(config,backend,API(),FakeTimers())
+    assert first['batches']['old']['state']=='submitted'
+    assert backend.known_sessions.count({'ref':'qa/old','version':1})==1
+    backend.terminal=True
+    second=await scan(config,backend,API(),FakeTimers())
+    assert second['batches']['old']['state']=='ended'
+    assert backend.known_sessions==[{'ref':'qa/other-project','version':7}]
+    backend.deleted=True
+    third=await scan(config,backend,API(),FakeTimers())
+    assert third['batches']['old']['state']=='ended'
+    assert backend.known_sessions==[{'ref':'qa/other-project','version':7}]

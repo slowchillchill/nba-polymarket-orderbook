@@ -49,6 +49,16 @@ class Timers:
     def cancel(self,batch_id):
         subprocess.run(['systemctl','stop','nba-orderbook-'+batch_id+'.timer'],check=False,capture_output=True)
 
+def update_registered_sessions(backend,state):
+    ended={(b['ref'],b['version']) for b in state['batches'].values()
+           if b['state']=='ended' and b.get('ref') and b.get('version')}
+    registered={(entry['ref'],entry['version']):entry for entry in backend.known_sessions
+                if (entry['ref'],entry['version']) not in ended}
+    for batch in state['batches'].values():
+        if batch['state']!='ended' and batch.get('ref') and batch.get('version'):
+            registered[(batch['ref'],batch['version'])]={'ref':batch['ref'],'version':batch['version']}
+    backend.known_sessions=list(registered.values())
+
 async def scan(config,backend,api,timers=None):
     timers=timers or Timers()
     store=Store(config['state_dir'])
@@ -63,7 +73,7 @@ async def scan(config,backend,api,timers=None):
                 row['ambiguous_market']=True
             elif gid in unique:
                 row['ambiguous_market']=False
-        backend.known_sessions.extend({'ref':b['ref'],'version':b['version']} for b in state['batches'].values() if b.get('ref') and b.get('version'))
+        update_registered_sessions(backend,state)
         for game in games:
             old=state['games'].get(game.game_id)
             if old:
@@ -154,6 +164,7 @@ async def scan(config,backend,api,timers=None):
                         b['state']='submitted'
                 except Exception as e:
                     b['status_error']=type(e).__name__
+        update_registered_sessions(backend,state)
         rows=[]
         for row in state['games'].values():
             game=row['game']; ref=f"{config['owner']}/{game['slug']}"
