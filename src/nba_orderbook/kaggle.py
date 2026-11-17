@@ -353,6 +353,8 @@ class Backend:
                                   slug=slug, title=slug, license_name='CC0-1.0', is_private=not public,
                                   files=files, description='NBA Polymarket 全场胜负市场订单簿与采集说明。'))
             if response.error:
+                # 明确拒绝没有未知副作用；下次调用仍先回查远端，再尝试发布。
+                _save(marker, {'ref': ref, 'version': expected, 'status': 'rejected'})
                 raise RuntimeError('dataset_write_rejected')
         except requests.RequestException:
             # 保留 pending；只回查一次写入的实际结果。

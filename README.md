@@ -19,6 +19,8 @@ nba-orderbook --config /etc/nba-orderbook/config.toml status
 
 最终 Dataset 每场三个文件：`orderbook.jsonl`、`metadata.json`、`summary.json`。采集端继续顺序写入并上传 `orderbook.jsonl.gz`，Kaggle 展开 gzip 后以 `orderbook.jsonl` 提供原始数据。原始消息记录 UTC 接收时间、连接标识、本地序号及完整原文。`book` 替换整个盘口，`price_change.size` 替换该价格数量，0 删除该档。未知消息仍保留原文。
 
+每场在 T−10 校验赛程，之后在明确观察到开赛前每五分钟复查；改期会重新安排该场窗口和 T−10 校验。市场连接每十秒发送 `PING`，二十秒内没有 `PONG` 时关闭并重连，重取双方快照且记录缺口。
+
 没有中间发布或检查点。最终发布前 Notebook 异常退出可能丢失此前全部采集。重连快照只能恢复当前盘口，不能补回历史增量。摘要保留实际覆盖、迟到、断线和停止原因，最终版不代表无缺口。
 
 部署和维护见 [部署说明](docs/deployment.md)。本次交付合同和进度见 [Issue #1](https://github.com/slowchillchill/nba-polymarket-orderbook/issues/1)。

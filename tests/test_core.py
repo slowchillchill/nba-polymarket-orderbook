@@ -308,3 +308,122 @@ async def test_cached_unique_game_without_current_candidate_keeps_discovering(tm
     api.current=True
     state=await scan(config,backend,api,timers)
     assert len(state['batches'])==1 and len(timers.scheduled)==2
+
+async def test_schedule_change_after_unchanged_t10_is_rechecked_and_pauses(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    g=game('2026-11-18T03:00:00Z');original=g.start
+    clock=[dt(g.start)-timedelta(minutes=10)];calls=[]
+    monkeypatch.setattr(collector,'now',lambda:clock[0])
+    class API:
+        async def resolution(self,g):return None
+        async def refresh(self,g):
+            calls.append(clock[0])
+            if len(calls)==2:g.reschedule('2026-11-18T05:00:00Z')
+            return g
+    c=Collection(g,tmp_path,API(),dt('2026-11-18T15:00:00Z'))
+    class Socket:
+        closed=False
+        async def close(self):self.closed=True
+    socket=Socket();c.socket=socket
+    async def step(seconds):
+        if len(calls)==2:c.stop.set()
+        else:clock[0]+=timedelta(minutes=5)
+    monkeypatch.setattr(collector.asyncio,'sleep',step)
+    await c.controls()
+    assert calls==[dt(original)-timedelta(minutes=10),dt(original)-timedelta(minutes=5)]
+    assert socket.closed and g.window>clock[0]
+    assert g.deadline==dt('2026-11-18T11:00:00Z')
+    assert c.next_schedule_check<=dt(g.start)-timedelta(minutes=10)
+
+async def test_late_reschedule_crossing_budget_is_seen_after_t10(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    g=game('2026-11-18T03:00:00Z');clock=[dt(g.start)-timedelta(minutes=10)];calls=[]
+    monkeypatch.setattr(collector,'now',lambda:clock[0])
+    class API:
+        async def resolution(self,g):return None
+        async def refresh(self,g):
+            calls.append(clock[0])
+            if len(calls)==2:g.reschedule('2026-11-18T10:00:00Z')
+            return g
+    async def step(seconds):clock[0]+=timedelta(minutes=5)
+    monkeypatch.setattr(collector.asyncio,'sleep',step)
+    c=Collection(g,tmp_path,API(),dt('2026-11-18T15:00:00Z'))
+    await c.controls()
+    assert len(calls)==2 and c.reason=='rescheduled_beyond_budget'
+
+async def test_observed_start_ends_schedule_refresh_and_freezes_deadline(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    g=game('2026-11-18T03:00:00Z');clock=[dt(g.start)-timedelta(minutes=10)];calls=[]
+    monkeypatch.setattr(collector,'now',lambda:clock[0])
+    class API:
+        async def resolution(self,g):return None
+        async def refresh(self,g):
+            calls.append(clock[0]);g.reschedule(g.start,live=True);return g
+    c=Collection(g,tmp_path,API(),dt('2026-11-18T15:00:00Z'))
+    async def step(seconds):
+        clock[0]+=timedelta(minutes=5)
+        if clock[0]>=dt(g.start):c.stop.set()
+    monkeypatch.setattr(collector.asyncio,'sleep',step)
+    await c.controls()
+    g.reschedule('2026-11-19T03:00:00Z')
+    assert len(calls)==1 and g.deadline==dt('2026-11-18T09:00:00Z')
+
+async def test_application_pong_deadline_reconnects_and_normal_pongs_are_retained(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    from nba_orderbook.model import now,iso
+    monkeypatch.setattr(collector,'HEARTBEAT_INTERVAL',.005)
+    monkeypatch.setattr(collector,'PONG_TIMEOUT',.02)
+    class API:
+        async def resolution(self,g):return None
+    for responding in (False,True):
+        attempts=[];sockets=[]
+        class Socket:
+            def __init__(self,attempt):
+                self.queue=asyncio.Queue();self.closed=False;self.pings=0
+                for asset in ('a','b'):
+                    self.queue.put_nowait(json.dumps({'event_type':'book','asset_id':asset,'bids':[{'price':'.2','size':str(attempt)}]}))
+                if attempt==2:self.queue.put_nowait(json.dumps({'event_type':'market_resolved','market':'condition'}))
+            def __aiter__(self):return self
+            async def __anext__(self):
+                value=await self.queue.get()
+                if value is None:raise StopAsyncIteration
+                return value
+            async def send(self,raw):
+                if raw=='PING':
+                    self.pings+=1
+                    if responding:
+                        self.queue.put_nowait('PONG')
+                        if self.pings==3:self.queue.put_nowait(json.dumps({'event_type':'market_resolved','market':'condition'}))
+            async def close(self):self.closed=True;self.queue.put_nowait(None)
+        class Connector:
+            async def __aenter__(self):
+                attempts.append(1);socket=Socket(len(attempts));sockets.append(socket);return socket
+            async def __aexit__(self,*args):pass
+        g=game(iso(now()+timedelta(hours=2)))
+        directory=tmp_path/str(responding)
+        c=Collection(g,directory,API(),now()+timedelta(hours=10),qa_seconds=10,connector=lambda *a,**kw:Connector())
+        result=await c.run()
+        with gzip.open(directory/'orderbook.jsonl.gz','rt') as stream:rows=[json.loads(line) for line in stream]
+        if responding:
+            assert len(attempts)==1 and sockets[0].closed is False
+            assert sum(row['raw']=='PONG' for row in rows)==3
+            assert not any(gap['kind']=='heartbeat_timeout' for gap in result['gaps'])
+        else:
+            assert len(attempts)==2 and sockets[0].closed
+            assert any(gap['kind']=='heartbeat_timeout' for gap in result['gaps'])
+            assert any(gap['kind']=='disconnect' for gap in result['gaps'])
+            assert c.book.assets['a']['bids']=={'0.2':'2'} and c.book.assets['b']['bids']=={'0.2':'2'}
+            assert len({row['connection_id'] for row in rows})==2
+
+async def test_heartbeat_send_failure_closes_connection(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    from nba_orderbook.model import now,iso
+    monkeypatch.setattr(collector,'HEARTBEAT_INTERVAL',.001)
+    class Socket:
+        closed=False
+        async def send(self,raw):raise RuntimeError('transport write failure')
+        async def close(self):self.closed=True
+    c=Collection(game(iso(now())),tmp_path,None,now()+timedelta(hours=10))
+    socket=Socket()
+    await c.heartbeat(socket,asyncio.Event())
+    assert socket.closed and c.gaps[0]['kind']=='heartbeat_error'

@@ -14,6 +14,8 @@ from .polymarket import Polymarket
 
 MARKET_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 SPORTS_WS = 'wss://sports-api.polymarket.com/ws'
+HEARTBEAT_INTERVAL = 10
+PONG_TIMEOUT = 20
 
 def write_json(path, data):
     path.write_text(json.dumps(data,ensure_ascii=False,indent=2,default=str)+'\n')
@@ -31,8 +33,7 @@ class Collection:
         self.messages = 0
         self.runtime_started_at = now()
         self.started_at = None
-        self.recheck = dt(game.start)-timedelta(minutes=10)
-        self.rechecked_start = None
+        self.next_schedule_check = dt(game.start)-timedelta(minutes=10)
         self.connection_id = None
         self.socket = None
         self.disconnect_at = None
@@ -61,11 +62,14 @@ class Collection:
                 except Exception as e:
                     self.gaps.append({'kind':'resolution_query_failed','at':iso(at),'error':type(e).__name__})
                 next_resolution = at+timedelta(minutes=5)
-            if at >= dt(self.game.start)-timedelta(minutes=10) and self.rechecked_start != self.game.start:
+            if not self.game.started and at >= self.next_schedule_check:
                 checked = self.game.start
+                self.next_schedule_check=at+timedelta(minutes=5)
                 try:
                     await self.api.refresh(self.game)
-                    self.rechecked_start = checked
+                    new_t10=dt(self.game.start)-timedelta(minutes=10)
+                    if at < new_t10 < self.next_schedule_check:
+                        self.next_schedule_check=new_t10
                     status = self.game.status.lower()
                     if status == 'postponed' and self.game.start == checked:
                         self.reason = 'postponed_waiting_schedule'
@@ -81,10 +85,19 @@ class Collection:
                     self.gaps.append({'kind':'schedule_check_failed','at':iso(at),'error':type(e).__name__})
             await asyncio.sleep(1)
 
-    async def heartbeat(self, socket):
+    async def heartbeat(self, socket, pong):
         while True:
-            await asyncio.sleep(10)
-            await socket.send('PING')
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            pong.clear()
+            sent_at=now()
+            try:
+                await socket.send('PING')
+                await asyncio.wait_for(pong.wait(),timeout=PONG_TIMEOUT)
+            except Exception as error:
+                self.gaps.append({'kind':'heartbeat_timeout' if isinstance(error,TimeoutError) else 'heartbeat_error',
+                                  'start':iso(sent_at),'end':iso(now()),'error':type(error).__name__})
+                await socket.close()
+                return
 
     async def receive(self, stream):
         disconnect_at = None
@@ -95,10 +108,11 @@ class Collection:
             try:
                 self.connection_id = uuid.uuid4().hex
                 self.book.snapshots.clear()
-                async with self.connector(MARKET_WS, max_size=None, ping_interval=None) as socket:
+                async with self.connector(MARKET_WS, max_size=None, ping_interval=None, close_timeout=5) as socket:
                     self.socket = socket
                     await socket.send(json.dumps({'assets_ids':self.game.assets,'type':'market','custom_feature_enabled':True}))
-                    heartbeat = asyncio.create_task(self.heartbeat(socket))
+                    pong=asyncio.Event()
+                    heartbeat = asyncio.create_task(self.heartbeat(socket,pong))
                     try:
                         async for raw in socket:
                             received = now()
@@ -109,6 +123,8 @@ class Collection:
                             self.messages += 1
                             stream.write(json.dumps({'received_at':iso(received),'connection_id':self.connection_id,
                                                      'sequence':self.messages,'raw':raw},ensure_ascii=True)+'\n')
+                            if raw == 'PONG':
+                                pong.set()
                             try:
                                 events = json.loads(raw)
                                 for event in events if isinstance(events,list) else [events]:

@@ -305,3 +305,79 @@ def test_catalog_upload_and_remote_names_are_unchanged(tmp_path):
     result=backend.catalog([{'slug':'game'}],tmp_path)
     assert result['files']==['catalog.json']
     assert [call.args[0].name for call in backend._upload.call_args_list]==['catalog.json']
+
+
+def test_rejected_dataset_create_can_retry_after_remote_recheck(tmp_path):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    final_files(tmp_path)
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(side_effect=[None, None, ready()])
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    def create(request):
+        if api.create_dataset.call_count == 1:
+            return N(error='rejected')
+        assert backend.inspect_dataset.call_count == 2
+        return N(error='')
+    api.create_dataset.side_effect = create
+    with pytest.raises(RuntimeError, match='dataset_write_rejected'):
+        backend.publish(tmp_path, 'owner/game')
+    assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'rejected'
+    assert backend.inspect_dataset.call_count == 1
+    assert api.create_dataset.call_count == 1
+    result = backend.publish(tmp_path, 'owner/game')
+    assert result['version'] == 1
+    assert api.create_dataset.call_count == 2
+    api.create_dataset_version.assert_not_called()
+    assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'ready'
+
+
+def test_rejected_catalog_version_recovers_on_next_scan(tmp_path):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    ref = 'owner/nba-polymarket-orderbook'
+    v1 = ready(ref, 1, ['catalog.json'])
+    v2 = ready(ref, 2, ['catalog.json'])
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(side_effect=[v1, v1, v1, v1, v2])
+    backend.read_json = Mock(return_value=[{'slug':'old'}])
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    def create_version(request):
+        if api.create_dataset_version.call_count == 1:
+            return N(error='rejected')
+        assert backend.inspect_dataset.call_count == 4
+        return N(error='')
+    api.create_dataset_version.side_effect = create_version
+    with pytest.raises(RuntimeError, match='dataset_write_rejected'):
+        backend.catalog([{'slug':'new'}], tmp_path)
+    assert json.loads((tmp_path/'.publish-state.json').read_text()) == {'ref':ref, 'version':2, 'status':'rejected'}
+    assert api.create_dataset_version.call_count == 1
+    assert backend.catalog([{'slug':'new'}], tmp_path)['version'] == 2
+    assert api.create_dataset_version.call_count == 2
+    api.create_dataset.assert_not_called()
+
+
+@pytest.mark.parametrize('catalog', [False, True])
+def test_unknown_publication_remains_pending_and_does_not_repeat_write(tmp_path, catalog):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    final_files(tmp_path)
+    api = Mock()
+    api.create_dataset.side_effect = requests.Timeout()
+    api.create_dataset_version.side_effect = requests.Timeout()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    existing = ready('owner/nba-polymarket-orderbook', 1, ['catalog.json']) if catalog else None
+    backend.inspect_dataset = Mock(return_value=existing)
+    backend.read_json = Mock(return_value=[{'slug':'old'}])
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    def publish():
+        return backend.catalog([{'slug':'new'}], tmp_path) if catalog else backend.publish(tmp_path,'owner/game')
+    with pytest.raises(OutcomeUnknown):
+        publish()
+    assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'pending'
+    uploads = backend._upload.call_count
+    with pytest.raises(OutcomeUnknown):
+        publish()
+    assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'pending'
+    assert backend._upload.call_count == uploads
+    assert api.create_dataset_version.call_count == int(catalog)
+    assert api.create_dataset.call_count == int(not catalog)
