@@ -1,0 +1,10 @@
+[Unit]
+Description=NBA Polymarket discovery and status
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/nba-orderbook/current
+EnvironmentFile=/etc/nba-orderbook/credentials.env
+ExecStart=/opt/nba-orderbook/venv/bin/python -m nba_orderbook.cli --config /etc/nba-orderbook/config.toml scheduler
+UMask=0077

@@ -1,0 +1,5 @@
+owner = "qiuqiuslowchillchill"
+source_dir = "/opt/nba-orderbook/current"
+state_dir = "/var/lib/nba-orderbook"
+# Kaggle CPU Save&RunAll 批次会话公开上限；可按账号实际限制覆盖。
+cpu_notebook_capacity = 5
