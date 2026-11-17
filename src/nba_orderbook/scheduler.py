@@ -64,7 +64,7 @@ async def scan(config,backend,api,timers=None):
     store=Store(config['state_dir'])
     games,anomalies=await api.discover()
     with store.locked() as state:
-        retry_batches={bid:b for bid,b in state['batches'].items() if b['state']=='planned' and b.get('error') in (SubmissionNotAttempted.__name__,SubmissionRejected.__name__)}
+        retry_batches={bid:b for bid,b in state['batches'].items() if b['state'] in ('planned','invalidated') and b.get('error') in (SubmissionNotAttempted.__name__,SubmissionRejected.__name__)}
         state['anomalies']=anomalies
         ambiguous={str(a['game_id']) for a in anomalies if a.get('reason')=='multiple_moneylines'}
         unique={game.game_id for game in games}
@@ -95,6 +95,33 @@ async def scan(config,backend,api,timers=None):
                     continue
             postponed=game.status.lower()=='postponed' and not game.postponed_with_time
             state['games'][game.game_id]={'game':game.to_dict(),'batch_id':None,'waiting_schedule':postponed,'ambiguous_market':game.game_id in ambiguous}
+        for bid,b in state['batches'].items():
+            if b['state']!='planned':
+                continue
+            valid=all(g['game_id'] in unique
+                      and not state['games'][g['game_id']].get('waiting_schedule')
+                      and not state['games'][g['game_id']].get('ambiguous_market')
+                      and all(state['games'][g['game_id']]['game'][key]==g[key]
+                              for key in ('start','condition_id','assets')) for g in b['games'])
+            if valid:
+                for g in b['games']:
+                    state['games'][g['game_id']]['batch_id']=bid
+                continue
+            b['state']='invalidated'
+            if bid not in retry_batches:
+                for row in state['games'].values():
+                    if row.get('batch_id')==bid:
+                        row['batch_id']=None
+            # 先持久化禁止提交，取消失败或旧任务已触发也不会使用旧候选。
+            store.save(state)
+            timers.cancel(bid)
+        try:
+            observed_active=backend.list_active()
+        except Exception as error:
+            state['observed_active_notebooks']=None
+            state['occupancy_error']=type(error).__name__
+            return state
+        state.pop('occupancy_error',None)
         for bid,b in list(state['batches'].items()):
             if b['state']=='planned':
                 timers.cancel(bid)
@@ -119,6 +146,7 @@ async def scan(config,backend,api,timers=None):
             for gid in members:
                 if gid not in retained:
                     state['games'][gid]['batch_id']=None
+            b['state']='planned'
             b['games']=[g.to_dict() for g in first_group]
             b['submit_at']=iso(min(g.window for g in first_group))
             retry_groups.append(first_group)
@@ -128,7 +156,7 @@ async def scan(config,backend,api,timers=None):
         fixed_groups=[[Game.from_dict(g) for g in b['games']] for b in state['batches'].values()
                       if b['state'] in ('submitted','submission_unknown','submitting')]
         state['required_peak_notebooks']=peak_concurrency(groups+retry_groups+fixed_groups)
-        state['observed_active_notebooks']=backend.list_active()
+        state['observed_active_notebooks']=observed_active
         state['cpu_notebook_capacity']=config.get('cpu_notebook_capacity')
         state['occupancy_coverage']='latest_and_registered_versions_not_exhaustive'
         for group in groups:
@@ -189,7 +217,12 @@ def submit_locked(batch,store,state,config,backend):
         return
     if at<dt(batch['submit_at']):
         return
-    active=backend.list_active()
+    try:
+        active=backend.list_active()
+    except Exception as error:
+        batch['capacity_error']=type(error).__name__
+        return
+    batch.pop('capacity_error',None)
     capacity=config.get('cpu_notebook_capacity')
     if capacity is not None and len(active)>=capacity:
         batch['capacity_wait_at']=iso(at)

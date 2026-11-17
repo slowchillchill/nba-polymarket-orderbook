@@ -223,13 +223,13 @@ async def test_new_ambiguity_cancels_old_plan_and_does_not_reuse_old_moneyline(t
     assert state['games']['1']['ambiguous_market'] is True
     assert state['anomalies'][0]['reason']=='multiple_moneylines'
     assert timers.cancelled==timers.scheduled
-    assert not state['batches']
+    assert not any(b['state']=='planned' for b in state['batches'].values())
     # 第三轮无候选且无新异常，不代表上一轮歧义已经解除。
     async def empty():return [],[]
     api.discover=empty
     state=await scan(config,backend,api,timers)
     assert state['games']['1']['ambiguous_market'] is True
-    assert not state['batches'] and len(timers.scheduled)==1
+    assert not any(b['state']=='planned' for b in state['batches'].values()) and len(timers.scheduled)==1
     # 第四轮明确选出唯一新 condition 后才重新安排。
     g.condition_id='new_unique_condition'
     async def unique():return [g],[]
@@ -237,7 +237,7 @@ async def test_new_ambiguity_cancels_old_plan_and_does_not_reuse_old_moneyline(t
     state=await scan(config,backend,api,timers)
     assert state['games']['1']['ambiguous_market'] is False
     assert len(timers.scheduled)==2
-    assert next(iter(state['batches'].values()))['games'][0]['condition_id']=='new_unique_condition'
+    assert next(b for b in state['batches'].values() if b['state']=='planned')['games'][0]['condition_id']=='new_unique_condition'
 
 async def test_active_schedule_updates_but_catalog_uses_final_published_time(tmp_path):
     from nba_orderbook.scheduler import scan,Store
@@ -304,10 +304,10 @@ async def test_cached_unique_game_without_current_candidate_keeps_discovering(tm
     await scan(config,backend,api,timers)
     api.current=False
     state=await scan(config,backend,api,timers)
-    assert not state['batches'] and len(timers.scheduled)==1
+    assert not any(b['state']=='planned' for b in state['batches'].values()) and len(timers.scheduled)==1
     api.current=True
     state=await scan(config,backend,api,timers)
-    assert len(state['batches'])==1 and len(timers.scheduled)==2
+    assert sum(b['state']=='planned' for b in state['batches'].values())==1 and len(timers.scheduled)==2
 
 async def test_schedule_change_after_unchanged_t10_is_rechecked_and_pauses(monkeypatch,tmp_path):
     from nba_orderbook import collector
@@ -453,10 +453,10 @@ async def test_postponed_with_new_time_survives_later_scans_and_new_untimed_epis
             assert row['game']['postponed_with_time'] is True
             assert row['game']['condition_id']=='current-condition-'+str(round)
             assert row['game']['assets']==['current-a-'+str(round),'current-b-'+str(round)]
-            assert row['waiting_schedule'] is False and len(state['batches'])==1
+            assert row['waiting_schedule'] is False and sum(b['state']=='planned' for b in state['batches'].values())==1
         if round==3:assert row['game']['postponed_with_time'] is False
     assert state['games']['1']['waiting_schedule'] is True
-    assert not state['batches']
+    assert not any(b['state']=='planned' for b in state['batches'].values())
 
 async def test_collector_keeps_accepted_postponed_time_and_rechecks_new_t10(monkeypatch,tmp_path):
     from nba_orderbook import collector
@@ -648,8 +648,8 @@ async def test_active_and_unknown_notebook_lookup_errors_are_not_free_capacity(t
                 response=requests.Response();response.status_code=403
                 raise requests.HTTPError('cannot verify registered version',response=response)
         backend=Backend();timers=FakeTimers()
-        with pytest.raises(requests.HTTPError):
-            await scan({'state_dir':str(path),'owner':'qa','_path':'unused'},backend,API(),timers)
+        failed=await scan({'state_dir':str(path),'owner':'qa','_path':'unused'},backend,API(),timers)
+        assert failed['occupancy_error']=='HTTPError' and failed['observed_active_notebooks'] is None
         assert timers.scheduled==[]
         assert {'ref':'qa/unconfirmed','version':1} in backend.known_sessions
 
@@ -752,3 +752,101 @@ async def test_real_backend_rejected_response_with_failed_absence_check_is_not_r
     second=await scan(config,backend,API(),FakeTimers())
     assert list(second['batches'])==[bid] and second['batches'][bid]['state']=='submission_unknown'
     assert kernels.writes==1
+
+class TrackingTimers(FakeTimers):
+    def __init__(self):super().__init__();self.active=set()
+    def schedule(self,bid,*args):super().schedule(bid,*args);self.active.add(bid)
+    def cancel(self,bid):super().cancel(bid);self.active.discard(bid)
+
+async def test_occupancy_timeout_preserves_valid_existing_future_timer_and_recovers(tmp_path):
+    import requests
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    g=game(iso(now()+timedelta(hours=3)))
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict())],[]
+    class Backend(SchedulerBackend):
+        timeout=False
+        def list_active(self):
+            if self.timeout:raise requests.Timeout('capacity read failed')
+            return []
+    backend=Backend();timers=TrackingTimers();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scan(config,backend,API(),timers);bid=first['games']['1']['batch_id']
+    assert timers.active=={bid}
+    backend.timeout=True
+    second=await scan(config,backend,API(),timers)
+    assert timers.active=={bid} and timers.cancelled==[]
+    assert second['batches'][bid]['state']=='planned' and second['games']['1']['batch_id']==bid
+    assert second['observed_active_notebooks'] is None and second['occupancy_error']=='Timeout'
+    assert json.loads((tmp_path/'state.json').read_text())['occupancy_error']=='Timeout'
+    backend.timeout=False
+    third=await scan(config,backend,API(),timers)
+    assert 'occupancy_error' not in third and third['observed_active_notebooks']==[]
+    assert third['games']['1']['batch_id'] in timers.active
+
+async def test_invalid_old_timer_is_persistently_blocked_before_cancel_even_when_capacity_fails(tmp_path):
+    import requests
+    from nba_orderbook.scheduler import scan,submit
+    from nba_orderbook.model import now,iso
+    for failure in ('missing','ambiguous','postponed','rescheduled'):
+        directory=tmp_path/failure
+        g=game(iso(now()+timedelta(hours=3)))
+        class API:
+            invalid=False;restored=False
+            async def discover(self):
+                if self.invalid and not self.restored:
+                    if failure=='missing':return [],[]
+                    if failure=='ambiguous':return [],[{'game_id':'1','reason':'multiple_moneylines'}]
+                current=Game.from_dict(g.to_dict())
+                if self.invalid and failure=='rescheduled':current.start=iso(dt(g.start)+timedelta(hours=1))
+                if self.invalid and not self.restored and failure=='postponed':current.status='Postponed'
+                return [current],[]
+        class Backend(SchedulerBackend):
+            timeout=False;writes=0
+            def list_active(self):
+                if self.timeout:raise requests.Timeout('capacity read failed')
+                return []
+            def submit(self,*args):self.writes+=1;raise AssertionError('old invalid timer must never submit')
+        class Timers(TrackingTimers):
+            enforce=False
+            def cancel(self,bid):
+                if self.enforce:
+                    durable=json.loads((directory/'state.json').read_text())
+                    assert durable['batches'][bid]['state']=='invalidated'
+                super().cancel(bid)
+        api=API();backend=Backend();timers=Timers();config={'state_dir':str(directory),'owner':'qa','_path':'unused'}
+        first=await scan(config,backend,api,timers);bid=first['games']['1']['batch_id']
+        timers.enforce=True;api.invalid=True;backend.timeout=True
+        second=await scan(config,backend,api,timers)
+        assert second['batches'][bid]['state']=='invalidated' and bid not in timers.active
+        assert submit(config,backend,bid)['state']=='invalidated'
+        assert backend.writes==0 and second['observed_active_notebooks'] is None
+        timers.enforce=False;api.restored=True;backend.timeout=False
+        third=await scan(config,backend,api,timers)
+        new_bid=third['games']['1']['batch_id']
+        assert new_bid!=bid and new_bid in timers.active
+        assert third['batches'][new_bid]['games'][0]['start']==(iso(dt(g.start)+timedelta(hours=1)) if failure=='rescheduled' else g.start)
+        assert 'occupancy_error' not in third
+
+async def test_due_capacity_failure_does_not_lose_other_future_group_timer(tmp_path):
+    import requests
+    from nba_orderbook.scheduler import scan,submit
+    from nba_orderbook.model import now,iso
+    due=game(iso(now()+timedelta(minutes=5)),'due')
+    future=game(iso(now()+timedelta(hours=5)),'future')
+    class API:
+        async def discover(self):return [due,future],[]
+    class Backend(SchedulerBackend):
+        reads=0;writes=0
+        def list_active(self):
+            self.reads+=1
+            if self.reads==2:raise requests.Timeout('due batch capacity lookup failed')
+            return []
+        def submit(self,batch,root):self.writes+=1;return {'ref':batch['ref'],'version':1}
+    backend=Backend();timers=TrackingTimers();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    state=await scan(config,backend,API(),timers)
+    due_bid=state['games']['due']['batch_id'];future_bid=state['games']['future']['batch_id']
+    assert backend.writes==0 and state['batches'][due_bid]['capacity_error']=='Timeout'
+    assert state['batches'][due_bid]['state']=='planned' and future_bid in timers.active
+    restored=submit(config,backend,due_bid)
+    assert restored['state']=='submitted' and 'capacity_error' not in restored and backend.writes==1
