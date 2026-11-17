@@ -8,6 +8,8 @@ from pathlib import Path
 import threading
 import time
 import zipfile
+from email.utils import parsedate_to_datetime
+from datetime import timezone
 
 import requests
 from kagglesdk import KaggleClient
@@ -51,6 +53,27 @@ class DatasetProcessingFailed(RuntimeError):
         super().__init__('dataset_processing_failed')
         self.ref = ref
         self.version = version
+
+
+def _is_http_429(error):
+    return isinstance(error,requests.HTTPError) and error.response is not None and error.response.status_code==429
+
+
+def retry_after_seconds(error,at,default_seconds):
+    """解析服务器等待时间；调用者决定本轮退出或在既有预算内等待。"""
+    raw=error.response.headers.get('Retry-After')
+    if raw:
+        try:
+            return float(max(0,int(raw)))
+        except (ValueError,OverflowError):
+            try:
+                target=parsedate_to_datetime(raw)
+                if target.tzinfo is None:
+                    target=target.replace(tzinfo=timezone.utc)
+                return max(0,(target-at).total_seconds())
+            except (ValueError,TypeError,AttributeError,OverflowError):
+                pass
+    return default_seconds
 
 
 def _request(cls, **values):
@@ -324,14 +347,20 @@ class Backend:
             with path.open('rb') as stream:
                 uploaded = requests.put(response.create_url, data=stream, timeout=(15, 300))
             uploaded.raise_for_status()
-        except requests.RequestException:
+        except requests.RequestException as error:
+            if _is_http_429(error):
+                raise
             # 官方上传协议支持同一 URL 的 Content-Range 状态查询。
             # 查询本身不重复创建 Dataset，也不输出带签名 URL。
             try:
                 observed = requests.put(response.create_url, data=b'',
                                         headers={'Content-Length': '0', 'Content-Range': f'bytes */{path.stat().st_size}'},
                                         timeout=(15, 90))
-            except requests.RequestException:
+                if observed.status_code==429:
+                    observed.raise_for_status()
+            except requests.RequestException as error:
+                if _is_http_429(error):
+                    raise
                 raise OutcomeUnknown('blob_upload_outcome_unknown') from None
             if observed.status_code not in (200, 201):
                 raise OutcomeUnknown('blob_upload_incomplete') from None
@@ -342,7 +371,9 @@ class Backend:
         while True:
             try:
                 observed = self.inspect_dataset(ref)
-            except requests.RequestException:
+            except requests.RequestException as error:
+                if _is_http_429(error):
+                    raise
                 observed = None
             if observed and observed['version'] >= expected_version:
                 if observed['status'] == 'FAILED' and observed['version'] == expected_version:
@@ -405,7 +436,9 @@ class Backend:
                 # 明确拒绝没有未知副作用；下次调用仍先回查远端，再尝试发布。
                 _save(marker, {'ref': ref, 'version': expected, 'status': 'rejected'})
                 raise RuntimeError('dataset_write_rejected')
-        except requests.RequestException:
+        except requests.RequestException as error:
+            if _is_http_429(error):
+                raise
             # 保留 pending；只回查一次写入的实际结果。
             pass
         result = self._wait_ready(ref, expected, remote_names)

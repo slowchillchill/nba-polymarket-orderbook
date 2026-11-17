@@ -667,3 +667,63 @@ def test_game_dataset_processing_failure_keeps_pending_without_new_version(tmp_p
         assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'pending'
     assert api.create_dataset.call_count == 1
     api.create_dataset_version.assert_not_called()
+
+
+def rate_limit_error():
+    error=http_error(429)
+    error.response.headers['Retry-After']='3600'
+    return error
+
+
+def test_wait_ready_propagates_original_429_without_sleep_or_further_inspection(monkeypatch):
+    error=rate_limit_error();backend=Backend(client=client(),ready_timeout=30,poll_seconds=10)
+    backend.inspect_dataset=Mock(side_effect=[error,ready()])
+    sleep=Mock();monkeypatch.setattr('nba_orderbook.kaggle.time.sleep',sleep)
+    with pytest.raises(requests.HTTPError) as observed:
+        backend._wait_ready('owner/game',1,FINAL_FILES)
+    assert observed.value is error and observed.value.response.headers['Retry-After']=='3600'
+    assert backend.inspect_dataset.call_count==1
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize('new_version',[False,True])
+def test_write_429_preserves_pending_and_only_reconciles_on_later_call(tmp_path,monkeypatch,new_version):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    error=rate_limit_error();api=Mock()
+    if new_version:api.create_dataset_version.side_effect=error
+    else:api.create_dataset.side_effect=error
+    ref='owner/nba-polymarket-orderbook';version=2 if new_version else 1
+    (tmp_path/'catalog.json').write_text('[]')
+    backend=Backend('owner',client=client(datasets=api),ready_timeout=30,poll_seconds=10)
+    backend.inspect_dataset=Mock(return_value=ready(ref,1,['catalog.json']) if new_version else None)
+    backend._upload=Mock(return_value=ApiDatasetNewFile())
+    sleep=Mock();monkeypatch.setattr('nba_orderbook.kaggle.time.sleep',sleep)
+    with pytest.raises(requests.HTTPError) as observed:
+        backend._publish(tmp_path,ref,['catalog.json'],public=True,new_version=new_version)
+    assert observed.value is error
+    assert backend.inspect_dataset.call_count==1 and backend._upload.call_count==1
+    marker=tmp_path/'.publish-state.json'
+    assert json.loads(marker.read_text())=={'ref':ref,'version':version,'status':'pending'}
+    assert api.create_dataset.call_count+api.create_dataset_version.call_count==1
+    sleep.assert_not_called()
+    backend.inspect_dataset=Mock(return_value=ready(ref,version,['catalog.json']))
+    result=backend._publish(tmp_path,ref,['catalog.json'],public=True,new_version=new_version)
+    assert result['status']=='READY'
+    assert api.create_dataset.call_count+api.create_dataset_version.call_count==1
+    assert backend._upload.call_count==1 and json.loads(marker.read_text())['status']=='ready'
+
+
+@pytest.mark.parametrize('recovering_upload',[False,True])
+def test_upload_429_stops_without_status_retries_and_preserves_response(tmp_path,monkeypatch,recovering_upload):
+    api=Mock();api.start_blob_upload.return_value=N(create_url='https://upload.invalid/signed',token='blob')
+    backend=Backend('owner',client=N(blobs=N(blob_api_client=api)))
+    path=tmp_path/'orderbook.jsonl.gz';path.write_bytes(b'compressed')
+    error=rate_limit_error()
+    put=Mock(side_effect=[requests.Timeout(),error.response] if recovering_upload else [error.response])
+    monkeypatch.setattr('nba_orderbook.kaggle.requests.put',put)
+    with pytest.raises(requests.HTTPError) as observed:
+        backend._upload(path)
+    assert observed.value.response is error.response
+    assert observed.value.response.headers['Retry-After']=='3600'
+    assert put.call_count==(2 if recovering_upload else 1)
+    api.start_blob_upload.assert_called_once()

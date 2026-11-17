@@ -8,6 +8,8 @@ from pathlib import Path
 import uuid
 from datetime import timedelta
 import websockets
+import requests
+from .kaggle import _is_http_429, retry_after_seconds
 from .book import Book
 from .model import Game, dt, iso, now
 from .polymarket import Polymarket
@@ -224,7 +226,23 @@ async def collect_batch(batch, output, backend, api=None):
         if summary['stop_reason'] in ('postponed_waiting_schedule','rescheduled_beyond_budget'):
             return summary
         print(json.dumps({'event':'publication_started','slug':game.slug,'at':iso(now())}),flush=True)
-        published=await asyncio.to_thread(backend.publish,directory,ref,public=not bool(batch.get('qa_seconds')))
+        fallback=getattr(backend,'poll_seconds',10)
+        while True:
+            try:
+                published=await asyncio.to_thread(backend.publish,directory,ref,public=not bool(batch.get('qa_seconds')))
+                break
+            except requests.HTTPError as error:
+                if not _is_http_429(error):
+                    raise
+                at=now()
+                delay=retry_after_seconds(error,at,fallback)
+                if at+timedelta(seconds=delay)>=budget_end:
+                    raise
+                print(json.dumps({'event':'publication_rate_limited','slug':game.slug,'retry_at':iso(at+timedelta(seconds=delay))}),flush=True)
+                await asyncio.sleep(delay)
+                if now()>=budget_end:
+                    raise
+                fallback*=2
         print(json.dumps({'event':'publication_ready','slug':game.slug,'at':iso(now()),'version':published.get('version')}),flush=True)
         return {**summary,'dataset':published,'game_start':game.start}
     try:
