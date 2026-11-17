@@ -44,6 +44,15 @@ class OutcomeUnknown(RuntimeError):
     """远端写入结果尚未确认；调用者必须保留原实例或发布状态。"""
 
 
+class DatasetProcessingFailed(RuntimeError):
+    """已确认指定 Dataset 版本处理失败。"""
+
+    def __init__(self, ref, version):
+        super().__init__('dataset_processing_failed')
+        self.ref = ref
+        self.version = version
+
+
 def _request(cls, **values):
     request = cls()
     for key, value in values.items():
@@ -336,7 +345,9 @@ class Backend:
             except requests.RequestException:
                 observed = None
             if observed and observed['version'] >= expected_version:
-                if observed['status'] in ('FAILED', 'DELETED'):
+                if observed['status'] == 'FAILED' and observed['version'] == expected_version:
+                    raise DatasetProcessingFailed(ref, expected_version)
+                if observed['status'] == 'DELETED':
                     raise RuntimeError('dataset_processing_failed')
                 if observed['status'] == 'READY' and set(names).issubset(observed['files']):
                     return observed
@@ -344,7 +355,8 @@ class Backend:
                 raise OutcomeUnknown('dataset_ready_not_confirmed')
             time.sleep(self.poll_seconds)
 
-    def _publish(self, directory, ref, names, *, public, new_version=False, remote_names=None):
+    def _publish(self, directory, ref, names, *, public, new_version=False, remote_names=None,
+                 failed_catalog_version=None):
         directory = Path(directory)
         remote_names = names if remote_names is None else remote_names
         prior = self.inspect_dataset(ref)
@@ -356,6 +368,15 @@ class Backend:
             result = self._wait_ready(ref, pending['version'], remote_names)
             _save(marker, {'ref': ref, 'version': result['version'], 'status': 'ready'})
             return result
+        if failed_catalog_version is not None:
+            # 仅目录允许从确知失败版本恢复；上传前重新确认当前远端版本。
+            if prior and prior['status'] == 'READY' and prior['version'] >= failed_catalog_version:
+                local = json.loads((directory / 'catalog.json').read_text())
+                if self.read_json(ref, 'catalog.json', prior['version']) == local:
+                    _save(marker, {'ref': ref, 'version': prior['version'], 'status': 'ready'})
+                    return {**prior, 'changed': False}
+            elif not (prior and prior['status'] == 'FAILED' and prior['version'] == failed_catalog_version):
+                raise OutcomeUnknown('failed_catalog_current_version_unknown')
         if prior and not new_version:
             result = self._wait_ready(ref, prior['version'], remote_names)
             # 已有最终版不能被本次不同的数据冒充为成功发布。
@@ -400,15 +421,28 @@ class Backend:
         rows = sorted(rows, key=lambda row: row['slug'])
         ref = f'{self.owner}/nba-polymarket-orderbook'
         marker = directory / '.publish-state.json'
-        if marker.exists():
-            pending = json.loads(marker.read_text())
-            if pending['status'] == 'pending':
+        pending = json.loads(marker.read_text()) if marker.exists() else None
+        if pending and pending['ref'] != ref:
+            raise RuntimeError('publication_directory_belongs_to_other_dataset')
+        try:
+            if pending and pending['status'] == 'pending':
                 reconciled = self._wait_ready(ref, pending['version'], ['catalog.json'])
                 _save(marker, {'ref': ref, 'version': reconciled['version'], 'status': 'ready'})
-        prior = self.inspect_dataset(ref)
-        if prior and prior['status'] == 'READY':
-            if self.read_json(ref, 'catalog.json', prior['version']) == rows:
-                return {**prior, 'changed': False}
-        _save(directory / 'catalog.json', rows)
-        result = self._publish(directory, ref, ['catalog.json'], public=True, new_version=bool(prior))
-        return {**result, 'changed': True}
+            failed_version = pending['version'] if pending and pending['status'] == 'failed' else None
+            prior = self.inspect_dataset(ref)
+            if prior and prior['status'] == 'READY':
+                if failed_version is not None and prior['version'] < failed_version:
+                    raise OutcomeUnknown('failed_catalog_current_version_unknown')
+                if self.read_json(ref, 'catalog.json', prior['version']) == rows:
+                    if failed_version is not None:
+                        _save(marker, {'ref': ref, 'version': prior['version'], 'status': 'ready'})
+                    return {**prior, 'changed': False}
+            _save(directory / 'catalog.json', rows)
+            result = self._publish(directory, ref, ['catalog.json'], public=True, new_version=bool(prior),
+                                   failed_catalog_version=failed_version)
+            return {**result, 'changed': result.get('changed', True)}
+        except DatasetProcessingFailed as exc:
+            state = json.loads(marker.read_text()) if marker.exists() else None
+            if state and state['ref'] == exc.ref == ref and state['status'] == 'pending' and state['version'] == exc.version:
+                _save(marker, {'ref': ref, 'version': exc.version, 'status': 'failed'})
+            raise

@@ -6,7 +6,7 @@ import json
 import pytest
 import requests
 
-from nba_orderbook.kaggle import Backend, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, SubmissionNotAttempted, SubmissionRejected, notebook_source
+from nba_orderbook.kaggle import Backend, DatasetProcessingFailed, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, SubmissionNotAttempted, SubmissionRejected, notebook_source
 
 
 def http_error(code):
@@ -520,3 +520,150 @@ def test_error_with_positive_version_is_not_a_confirmed_rejection(tmp_path):
         backend.submit({'id':'batch'}, tmp_path)
     assert api.save_kernel.call_count == 1
     assert api.list_kernels.call_count == 1
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def test_catalog_confirmed_failed_version_recovers_on_next_call(tmp_path, restart):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile, ApiGetDatasetStatusResponse
+    from kagglesdk.datasets.types.dataset_enums import DatabundleVersionStatus
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    state = {'version': 2 if restart else 1,
+             'status': DatabundleVersionStatus.FAILED if restart else DatabundleVersionStatus.READY}
+    if restart:
+        marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':'pending'}))
+    api = Mock()
+    api.get_dataset.side_effect = lambda _: N(current_version_number=state['version'], is_private=False)
+    def get_status(_):
+        response = ApiGetDatasetStatusResponse()
+        response.status = state['status']
+        return response
+    api.get_dataset_status.side_effect = get_status
+    api.list_dataset_files.return_value = N(dataset_files=[N(name='catalog.json')], next_page_token='', error_message='')
+    created_versions = []
+    def create_version(_):
+        state['version'] += 1
+        created_versions.append(state['version'])
+        state['status'] = DatabundleVersionStatus.FAILED if state['version'] == 2 else DatabundleVersionStatus.READY
+        return N(error='')
+    api.create_dataset_version.side_effect = create_version
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    backend.read_json = Mock(return_value=[{'slug':'old'}])
+    with pytest.raises(DatasetProcessingFailed) as failure:
+        backend.catalog([{'slug':'new'}], tmp_path)
+    assert failure.value.version == 2
+    assert json.loads(marker.read_text()) == {'ref':ref, 'version':2, 'status':'failed'}
+    assert created_versions == ([] if restart else [2])
+    assert backend.catalog([{'slug':'new'}], tmp_path)['version'] == 3
+    assert created_versions == ([3] if restart else [2, 3])
+    assert json.loads(marker.read_text()) == {'ref':ref, 'version':3, 'status':'ready'}
+    api.create_dataset.assert_not_called()
+
+
+@pytest.mark.parametrize('version,status', [(2,'REPROCESSING'), (2,'BLOBS_RECEIVED'),
+                                           (1,'FAILED'), (3,'FAILED'), (2,'DELETED')])
+def test_catalog_pending_unconfirmed_failure_never_repeats_write(tmp_path, version, status):
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':'pending'}))
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(return_value={**ready(ref,version,['catalog.json']), 'status':status})
+    backend._upload = Mock()
+    for _ in range(2):
+        with pytest.raises(RuntimeError if status == 'DELETED' else OutcomeUnknown):
+            backend.catalog([{'slug':'new'}], tmp_path)
+        assert json.loads(marker.read_text())['status'] == 'pending'
+    backend._upload.assert_not_called()
+    api.create_dataset.assert_not_called()
+    api.create_dataset_version.assert_not_called()
+
+
+def test_catalog_pending_failed_read_keeps_pending_without_write(tmp_path):
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':'pending'}))
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(side_effect=requests.Timeout())
+    backend._upload = Mock()
+    for _ in range(2):
+        with pytest.raises(OutcomeUnknown):
+            backend.catalog([{'slug':'new'}], tmp_path)
+        assert json.loads(marker.read_text())['status'] == 'pending'
+    backend._upload.assert_not_called()
+    api.create_dataset_version.assert_not_called()
+
+
+@pytest.mark.parametrize('version,status', [(1,'FAILED'), (3,'FAILED'), (2,'REPROCESSING'),
+                                           (2,'DELETED'), (1,'READY'), (None,None)])
+def test_catalog_failed_marker_requires_safe_current_version_before_upload(tmp_path, version, status):
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':'failed'}))
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    observed = {**ready(ref,version,['catalog.json']), 'status':status} if version else None
+    backend.inspect_dataset = Mock(return_value=observed)
+    backend._upload = Mock()
+    with pytest.raises(OutcomeUnknown):
+        backend.catalog([{'slug':'new'}], tmp_path)
+    assert json.loads(marker.read_text())['status'] == 'failed'
+    backend._upload.assert_not_called()
+    api.create_dataset.assert_not_called()
+    api.create_dataset_version.assert_not_called()
+
+
+@pytest.mark.parametrize('marker_status', ['pending', 'failed'])
+def test_catalog_new_ready_matching_rows_recovers_without_write(tmp_path, marker_status):
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':marker_status}))
+    api = Mock()
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(return_value=ready(ref,3,['catalog.json']))
+    backend.read_json = Mock(return_value=[{'slug':'new'}])
+    backend._upload = Mock()
+    result = backend.catalog([{'slug':'new'}], tmp_path)
+    assert (result['version'], result['changed']) == (3,False)
+    assert json.loads(marker.read_text()) == {'ref':ref, 'version':3, 'status':'ready'}
+    backend._upload.assert_not_called()
+    api.create_dataset_version.assert_not_called()
+
+
+@pytest.mark.parametrize('same_rows', [True, False])
+def test_catalog_failed_recovery_rechecks_new_ready_immediately_before_upload(tmp_path, same_rows):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    ref = 'owner/nba-polymarket-orderbook'
+    marker = tmp_path/'.publish-state.json'
+    marker.write_text(json.dumps({'ref':ref, 'version':2, 'status':'failed'}))
+    api = Mock()
+    api.create_dataset_version.return_value = N(error='')
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    backend.inspect_dataset = Mock(side_effect=[{**ready(ref,2,['catalog.json']), 'status':'FAILED'},
+                                               ready(ref,3,['catalog.json']), ready(ref,4,['catalog.json'])])
+    backend.read_json = Mock(return_value=[{'slug':'new' if same_rows else 'old'}])
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    result = backend.catalog([{'slug':'new'}], tmp_path)
+    assert (result['version'], result['changed']) == ((3,False) if same_rows else (4,True))
+    assert backend._upload.call_count == int(not same_rows)
+    assert api.create_dataset_version.call_count == int(not same_rows)
+    api.create_dataset.assert_not_called()
+
+
+def test_game_dataset_processing_failure_keeps_pending_without_new_version(tmp_path):
+    from kagglesdk.datasets.types.dataset_api_service import ApiDatasetNewFile
+    final_files(tmp_path)
+    api = Mock()
+    api.create_dataset.return_value = N(error='')
+    backend = Backend('owner', client=client(datasets=api), ready_timeout=0)
+    failed = {**ready(), 'status':'FAILED'}
+    backend.inspect_dataset = Mock(side_effect=[None, failed, failed, failed])
+    backend._upload = Mock(return_value=ApiDatasetNewFile())
+    for _ in range(2):
+        with pytest.raises(DatasetProcessingFailed):
+            backend.publish(tmp_path,'owner/game')
+        assert json.loads((tmp_path/'.publish-state.json').read_text())['status'] == 'pending'
+    assert api.create_dataset.call_count == 1
+    api.create_dataset_version.assert_not_called()
