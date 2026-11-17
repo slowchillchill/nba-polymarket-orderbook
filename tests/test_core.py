@@ -427,3 +427,188 @@ async def test_heartbeat_send_failure_closes_connection(monkeypatch,tmp_path):
     socket=Socket()
     await c.heartbeat(socket,asyncio.Event())
     assert socket.closed and c.gaps[0]['kind']=='heartbeat_error'
+
+async def test_postponed_with_new_time_survives_later_scans_and_new_untimed_episode_waits(tmp_path):
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    original=game(iso(now()+timedelta(hours=3)))
+    revised=iso(now()+timedelta(hours=4))
+    class API:
+        round=0
+        async def discover(self):
+            current=Game.from_dict(original.to_dict())
+            if self.round:
+                current.start=revised
+                current.status='Scheduled' if self.round==3 else 'Postponed'
+                current.condition_id='current-condition-'+str(self.round)
+                current.assets=['current-a-'+str(self.round),'current-b-'+str(self.round)]
+            return [current],[]
+    api=API();backend=SchedulerBackend();timers=FakeTimers()
+    config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    for round in range(5):
+        api.round=round
+        state=await scan(config,backend,api,timers)
+        row=state['games']['1']
+        if round in (1,2):
+            assert row['game']['postponed_with_time'] is True
+            assert row['game']['condition_id']=='current-condition-'+str(round)
+            assert row['game']['assets']==['current-a-'+str(round),'current-b-'+str(round)]
+            assert row['waiting_schedule'] is False and len(state['batches'])==1
+        if round==3:assert row['game']['postponed_with_time'] is False
+    assert state['games']['1']['waiting_schedule'] is True
+    assert not state['batches']
+
+async def test_collector_keeps_accepted_postponed_time_and_rechecks_new_t10(monkeypatch,tmp_path):
+    from nba_orderbook import collector
+    g=game('2026-11-18T03:00:00Z');clock=[dt(g.start)-timedelta(minutes=10)];calls=[]
+    monkeypatch.setattr(collector,'now',lambda:clock[0])
+    class API:
+        async def resolution(self,g):return None
+        async def refresh(self,g):
+            calls.append(clock[0])
+            g.reschedule('2026-11-18T05:00:00Z','Scheduled' if len(calls)==4 else 'Postponed')
+            return g
+    async def step(seconds):
+        if len(calls)==2:clock[0]=dt('2026-11-18T04:50:00Z')
+        else:clock[0]+=timedelta(minutes=5)
+    monkeypatch.setattr(collector.asyncio,'sleep',step)
+    c=Collection(g,tmp_path,API(),dt('2026-11-18T15:00:00Z'))
+    class Socket:
+        async def close(self):pass
+    c.socket=Socket()
+    await c.controls()
+    assert len(calls)==5 and calls[2]==dt('2026-11-18T04:50:00Z')
+    assert len(g.time_changes)==1
+    assert c.reason=='postponed_waiting_schedule' and g.postponed_with_time is False
+
+async def test_not_attempted_submission_keeps_batch_id_across_reschedule_and_retry(monkeypatch,tmp_path):
+    from nba_orderbook import scheduler
+    from nba_orderbook.kaggle import SubmissionNotAttempted
+    from nba_orderbook.model import now,iso
+    clock=[now()];monkeypatch.setattr(scheduler,'now',lambda:clock[0])
+    current=game(iso(clock[0]+timedelta(minutes=5)))
+    class API:
+        async def discover(self):return [Game.from_dict(current.to_dict())],[]
+    class Backend(SchedulerBackend):
+        def __init__(self):super().__init__();self.attempts=[]
+        def submit(self,batch,root):
+            self.attempts.append((batch['id'],batch['ref']))
+            if len(self.attempts)==1:raise SubmissionNotAttempted('read failed before SaveKernel')
+            return {'ref':batch['ref'],'version':1}
+    backend=Backend();timers=FakeTimers();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scheduler.scan(config,backend,API(),timers)
+    bid=next(iter(first['batches']))
+    assert first['batches'][bid]['state']=='planned'
+    current.start=iso(clock[0]+timedelta(hours=2))
+    second=await scheduler.scan(config,backend,API(),timers)
+    assert list(second['batches'])==[bid] and len(backend.attempts)==1
+    assert timers.scheduled==[bid]
+    clock[0]=current.window
+    third=await scheduler.scan(config,backend,API(),timers)
+    assert third['batches'][bid]['state']=='submitted'
+    assert len(backend.attempts)==2 and backend.attempts[0]==backend.attempts[1]
+
+def test_unexpected_submission_exception_stays_unknown(tmp_path):
+    from nba_orderbook.scheduler import Store,submit_locked
+    from nba_orderbook.model import now,iso
+    class Backend(SchedulerBackend):
+        calls=0
+        def submit(self,*args):self.calls+=1;raise ValueError('after possible SaveKernel')
+    backend=Backend();g=game(iso(now()+timedelta(minutes=5)))
+    batch={'id':'fixed','state':'planned','games':[g.to_dict()],'submit_at':iso(g.window)}
+    state={'batches':{'fixed':batch}};store=Store(tmp_path)
+    submit_locked(batch,store,state,{'owner':'qa'},backend)
+    submit_locked(batch,store,state,{'owner':'qa'},backend)
+    assert batch['state']=='submission_unknown' and backend.calls==1
+
+
+def test_old_game_state_without_postponement_field_remains_readable():
+    old=game().to_dict();old.pop('postponed_with_time')
+    restored=Game.from_dict(old)
+    assert restored.postponed_with_time is False
+    restored.reschedule(restored.start,'Postponed')
+    assert restored.postponed_with_time is False
+
+async def test_retryable_batch_waits_through_missing_and_ambiguous_discovery(tmp_path):
+    from nba_orderbook import scheduler
+    from nba_orderbook.kaggle import SubmissionNotAttempted
+    from nba_orderbook.model import now,iso
+    g=game(iso(now()+timedelta(minutes=5)))
+    class API:
+        round=0
+        async def discover(self):
+            if self.round==1:return [],[{'game_id':'1','reason':'multiple_moneylines'}]
+            if self.round==2:return [],[]
+            return [Game.from_dict(g.to_dict())],[]
+    class Backend(SchedulerBackend):
+        def __init__(self):super().__init__();self.ids=[]
+        def submit(self,batch,root):
+            self.ids.append(batch['id'])
+            if len(self.ids)==1:raise SubmissionNotAttempted('prewrite read failed')
+            return {'ref':batch['ref'],'version':1}
+    api=API();backend=Backend();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    for round in range(4):
+        api.round=round
+        state=await scheduler.scan(config,backend,api,FakeTimers())
+        assert len(state['batches'])==1
+        if round in (1,2):assert len(backend.ids)==1
+    assert len(backend.ids)==2 and backend.ids[0]==backend.ids[1]
+
+async def test_unknown_submission_never_rebuilds_batch_during_later_scan(tmp_path):
+    from nba_orderbook import scheduler
+    from nba_orderbook.model import now,iso
+    g=game(iso(now()+timedelta(minutes=5)))
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict())],[]
+    class Backend(SchedulerBackend):
+        def __init__(self):super().__init__();self.calls=0
+        def submit(self,batch,root):self.calls+=1;raise ValueError('write may have happened')
+        def snapshot(self,*args):raise RuntimeError('still cannot confirm remote')
+    backend=Backend();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused'}
+    first=await scheduler.scan(config,backend,API(),FakeTimers())
+    bid=next(iter(first['batches']))
+    second=await scheduler.scan(config,backend,API(),FakeTimers())
+    assert list(second['batches'])==[bid] and second['batches'][bid]['state']=='submission_unknown'
+    assert backend.calls==1
+
+async def test_prewrite_retry_is_regrouped_before_save_after_game_moves_beyond_two_hours(monkeypatch,tmp_path):
+    from nba_orderbook import scheduler
+    from nba_orderbook.kaggle import SubmissionNotAttempted
+    from nba_orderbook.model import now,iso
+    clock=now();monkeypatch.setattr(scheduler,'now',lambda:clock)
+    a=game(iso(clock+timedelta(minutes=60)),'A');a.slug='nba-a'
+    b=game(iso(clock+timedelta(minutes=120)),'B');b.slug='nba-b'
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict()) for g in (a,b)],[]
+    class Backend(SchedulerBackend):
+        def __init__(self):super().__init__();self.attempts=[]
+        def submit(self,batch,root):
+            self.attempts.append({'id':batch['id'],'ref':batch['ref'],'games':[g.copy() for g in batch['games']]})
+            if len(self.attempts)==1:raise SubmissionNotAttempted('no SaveKernel before failed list')
+            return {'ref':batch['ref'],'version':1}
+    backend=Backend();timers=FakeTimers();config={'state_dir':str(tmp_path),'owner':'qa','_path':'unused','cpu_notebook_capacity':5}
+    first=await scheduler.scan(config,backend,API(),timers)
+    original=next(iter(first['batches']))
+    assert first['batches'][original]['state']=='planned'
+    assert len(first['batches'][original]['games'])==2
+    b.start=iso(clock+timedelta(hours=5))
+    second=await scheduler.scan(config,backend,API(),timers)
+    assert second['batches'][original]['state']=='submitted'
+    assert [g['game_id'] for g in second['batches'][original]['games']]==['A']
+    remaining=[batch for bid,batch in second['batches'].items() if bid!=original]
+    assert len(remaining)==1 and remaining[0]['state']=='planned'
+    assert [g['game_id'] for g in remaining[0]['games']]==['B']
+    assert remaining[0]['id'] in timers.scheduled
+    assert second['games']['B']['batch_id']==remaining[0]['id']
+    assert backend.attempts[0]['id']==backend.attempts[1]['id']==original
+    assert backend.attempts[0]['ref']==backend.attempts[1]['ref']
+    assert second['required_peak_notebooks']==2
+    for saved in backend.attempts[1:]:
+        starts=[dt(g['start']) for g in saved['games']]
+        assert max(starts)-min(starts)<=timedelta(hours=2)
+    # 下一轮不能丢失脱离原重试组的B，已经提交的A也不能被重新分组。
+    third=await scheduler.scan(config,backend,API(),timers)
+    assert third['batches'][original]['games']==second['batches'][original]['games']
+    assigned=third['games']['B']['batch_id']
+    assert third['batches'][assigned]['state']=='planned' and assigned in timers.scheduled
+    assert third['required_peak_notebooks']==2 and len(backend.attempts)==2

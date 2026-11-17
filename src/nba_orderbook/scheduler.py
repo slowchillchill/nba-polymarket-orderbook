@@ -9,6 +9,7 @@ import uuid
 from contextlib import contextmanager
 from .model import Game, dt, iso, now, group_games, peak_concurrency
 from .collector import write_json
+from .kaggle import SubmissionNotAttempted
 
 ACTIVE={'QUEUED','RUNNING','CANCEL_REQUESTED'}
 TERMINAL={'COMPLETE','ERROR','CANCEL_ACKNOWLEDGED','CANCELLED'}
@@ -53,6 +54,7 @@ async def scan(config,backend,api,timers=None):
     store=Store(config['state_dir'])
     games,anomalies=await api.discover()
     with store.locked() as state:
+        retry_batches={bid:b for bid,b in state['batches'].items() if b['state']=='planned' and b.get('error')==SubmissionNotAttempted.__name__}
         state['anomalies']=anomalies
         ambiguous={str(a['game_id']) for a in anomalies if a.get('reason')=='multiple_moneylines'}
         unique={game.game_id for game in games}
@@ -64,27 +66,58 @@ async def scan(config,backend,api,timers=None):
         backend.known_sessions.extend({'ref':b['ref'],'version':b['version']} for b in state['batches'].values() if b.get('ref') and b.get('version'))
         for game in games:
             old=state['games'].get(game.game_id)
-            old_start=old['game']['start'] if old else None
             if old:
+                previous=Game.from_dict(old['game'])
+                previous.reschedule(game.start,game.status,game.started)
+                game.start=previous.start
+                game.started=previous.started
+                game.time_changes=previous.time_changes
+                game.postponed_with_time=previous.postponed_with_time
                 old['game']=game.to_dict()
+                old['waiting_schedule']=game.status.lower()=='postponed' and not game.postponed_with_time
+                if old.get('batch_id') in retry_batches:
+                    continue
             if old and old.get('batch_id') and state['batches'][old['batch_id']]['state'] not in ('planned','ended','missed_window'):
                 continue
             if old and old.get('batch_id') and state['batches'][old['batch_id']]['state']=='ended':
                 published=backend.inspect_dataset(f"{config['owner']}/{game.slug}")
                 if published and published.get('status','').lower()=='ready' and published.get('summary'):
                     continue
-            postponed=game.status.lower()=='postponed' and (not old or old_start==game.start)
+            postponed=game.status.lower()=='postponed' and not game.postponed_with_time
             state['games'][game.game_id]={'game':game.to_dict(),'batch_id':None,'waiting_schedule':postponed,'ambiguous_market':game.game_id in ambiguous}
         for bid,b in list(state['batches'].items()):
             if b['state']=='planned':
                 timers.cancel(bid)
+                if bid in retry_batches:
+                    continue
                 del state['batches'][bid]
                 for row in state['games'].values():
                     if row.get('batch_id')==bid:
                         row['batch_id']=None
+        retry_groups=[]
+        ready_retries={}
+        for bid,b in retry_batches.items():
+            members=[g['game_id'] for g in b['games']]
+            eligible=[Game.from_dict(state['games'][gid]['game']) for gid in members
+                      if gid in unique and not state['games'][gid].get('waiting_schedule')
+                      and not state['games'][gid].get('ambiguous_market')]
+            if not eligible:
+                continue
+            # 尚未尝试 SaveKernel，按本轮时间重新分组。原身份延续给首个合法组。
+            first_group=group_games(eligible)[0]
+            retained={g.game_id for g in first_group}
+            for gid in members:
+                if gid not in retained:
+                    state['games'][gid]['batch_id']=None
+            b['games']=[g.to_dict() for g in first_group]
+            b['submit_at']=iso(min(g.window for g in first_group))
+            retry_groups.append(first_group)
+            ready_retries[bid]=b
         pending=[Game.from_dict(r['game']) for gid,r in state['games'].items() if gid in unique and not r.get('batch_id') and not r.get('waiting_schedule') and not r.get('ambiguous_market')]
         groups=group_games(pending)
-        state['required_peak_notebooks']=peak_concurrency(groups)
+        fixed_groups=[[Game.from_dict(g) for g in b['games']] for b in state['batches'].values()
+                      if b['state'] in ('submitted','submission_unknown','submitting')]
+        state['required_peak_notebooks']=peak_concurrency(groups+retry_groups+fixed_groups)
         state['observed_active_notebooks']=backend.list_active()
         state['cpu_notebook_capacity']=config.get('cpu_notebook_capacity')
         state['occupancy_coverage']='latest_and_registered_versions_not_exhaustive'
@@ -95,6 +128,12 @@ async def scan(config,backend,api,timers=None):
             state['batches'][bid]=b
             for game in group:
                 state['games'][game.game_id]['batch_id']=bid
+            store.save(state)
+            if dt(b['submit_at'])<=now():
+                submit_locked(b,store,state,config,backend)
+            else:
+                timers.schedule(bid,b['submit_at'],store.path,config['_path'])
+        for bid,b in ready_retries.items():
             store.save(state)
             if dt(b['submit_at'])<=now():
                 submit_locked(b,store,state,config,backend)
@@ -152,6 +191,9 @@ def submit_locked(batch,store,state,config,backend):
         result=backend.submit(batch,Path(config.get('source_dir',Path.cwd())))
         batch.update(result)
         batch['state']='submitted'
+    except SubmissionNotAttempted as e:
+        batch['state']='planned'
+        batch['error']=type(e).__name__
     except Exception as e:
         batch['state']='submission_unknown'
         batch['error']=type(e).__name__

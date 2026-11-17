@@ -32,6 +32,10 @@ FINAL_FILES = ('orderbook.jsonl', 'metadata.json', 'summary.json')
 MARKER = '# nba_batch_id: '
 
 
+class SubmissionNotAttempted(RuntimeError):
+    """首次只读查询失败，尚未发送写请求；重试必须保留同一批次身份。"""
+
+
 class OutcomeUnknown(RuntimeError):
     """远端写入结果尚未确认；调用者必须保留原实例或发布状态。"""
 
@@ -183,8 +187,15 @@ class Backend:
         slug = ('nba-qa-' if qa else 'nba-batch-') + batch['id']
         ref = f'{self.owner}/{slug}'
         # Kaggle 对缺失引用也可能返回 403；不靠 GetKernel 的状态码判不存在。
-        if any(kernel.ref == ref for kernel in self._own_kernels()):
-            existing = self.snapshot(ref)
+        try:
+            kernels = self._own_kernels()
+        except Exception:
+            raise SubmissionNotAttempted('kernel_listing_failed_before_submission') from None
+        if any(kernel.ref == ref for kernel in kernels):
+            try:
+                existing = self.snapshot(ref)
+            except Exception:
+                raise OutcomeUnknown('existing_kernel_status_unknown') from None
             if existing['batch_id'] == batch['id']:
                 return existing
             raise OutcomeUnknown('kernel_exists_with_other_batch')
@@ -200,14 +211,14 @@ class Backend:
             if result.error or result.invalid_tags or result.invalid_dataset_sources or result.invalid_kernel_sources or result.invalid_competition_sources or result.invalid_model_sources:
                 raise RuntimeError('kernel_submission_rejected')
             return {'ref': ref, 'version': result.version_number, 'status': 'QUEUED', 'batch_id': batch['id']}
-        except (requests.RequestException, RuntimeError):
-            # 超时后回查同一 ref，绝不第二次 SaveKernel。
+        except Exception:
+            # SaveKernel 一旦开始调用，异常不能证明未写入；只回查同一 ref。
             try:
                 observed = self.snapshot(ref)
-            except requests.RequestException:
+                if observed['batch_id'] != batch['id']:
+                    raise OutcomeUnknown('kernel_submission_outcome_unknown')
+            except Exception:
                 raise OutcomeUnknown('kernel_submission_outcome_unknown') from None
-            if observed['batch_id'] != batch['id']:
-                raise OutcomeUnknown('kernel_submission_outcome_unknown')
             return observed
 
     def list_active(self):

@@ -63,7 +63,6 @@ class Collection:
                     self.gaps.append({'kind':'resolution_query_failed','at':iso(at),'error':type(e).__name__})
                 next_resolution = at+timedelta(minutes=5)
             if not self.game.started and at >= self.next_schedule_check:
-                checked = self.game.start
                 self.next_schedule_check=at+timedelta(minutes=5)
                 try:
                     await self.api.refresh(self.game)
@@ -71,7 +70,7 @@ class Collection:
                     if at < new_t10 < self.next_schedule_check:
                         self.next_schedule_check=new_t10
                     status = self.game.status.lower()
-                    if status == 'postponed' and self.game.start == checked:
+                    if status == 'postponed' and not self.game.postponed_with_time:
                         self.reason = 'postponed_waiting_schedule'
                         self.stop.set()
                         return

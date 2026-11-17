@@ -6,7 +6,7 @@ import json
 import pytest
 import requests
 
-from nba_orderbook.kaggle import Backend, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, notebook_source
+from nba_orderbook.kaggle import Backend, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, SubmissionNotAttempted, notebook_source
 
 
 def http_error(code):
@@ -194,7 +194,7 @@ def test_kernel_listing_error_prevents_creation(page_one):
     api = Mock()
     api.list_kernels.side_effect = [http_error(403)] if page_one else [N(kernels=[],next_page_token='p2'),http_error(403)]
     backend = Backend('owner', client=client(kernels=api))
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(SubmissionNotAttempted):
         backend.submit({'id':'batch'},Path('/unused'))
     api.save_kernel.assert_not_called()
 
@@ -381,3 +381,61 @@ def test_unknown_publication_remains_pending_and_does_not_repeat_write(tmp_path,
     assert backend._upload.call_count == uploads
     assert api.create_dataset_version.call_count == int(catalog)
     assert api.create_dataset.call_count == int(not catalog)
+
+
+@pytest.mark.parametrize('failure', [requests.Timeout(), ValueError('malformed read response')])
+def test_submission_read_failure_can_recover_with_one_actual_write(tmp_path, failure):
+    from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelResponse
+    api = Mock()
+    api.list_kernels.side_effect = [failure, N(kernels=[], next_page_token='')]
+    response = ApiSaveKernelResponse()
+    response.version_number = 1
+    api.save_kernel.return_value = response
+    backend = Backend('owner', client=client(kernels=api))
+    (tmp_path/'src/nba_orderbook').mkdir(parents=True)
+    (tmp_path/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    with pytest.raises(SubmissionNotAttempted):
+        backend.submit({'id':'batch'}, tmp_path)
+    api.save_kernel.assert_not_called()
+    result = backend.submit({'id':'batch'}, tmp_path)
+    assert result['ref'] == 'owner/nba-batch-batch'
+    assert result['version'] == 1
+    assert api.save_kernel.call_count == 1
+
+
+@pytest.mark.parametrize('failure', [requests.Timeout(), ValueError('malformed snapshot')])
+def test_existing_kernel_read_failure_is_unknown_not_retryable(failure):
+    api = Mock()
+    api.list_kernels.return_value = N(kernels=[N(ref='owner/nba-batch-batch')], next_page_token='')
+    backend = Backend('owner', client=client(kernels=api))
+    backend.snapshot = Mock(side_effect=failure)
+    with pytest.raises(OutcomeUnknown):
+        backend.submit({'id':'batch'}, Path('/unused'))
+    api.save_kernel.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', [requests.Timeout(), ValueError('malformed write response')])
+def test_write_failure_then_failed_recheck_is_always_unknown(tmp_path, failure):
+    api = Mock()
+    api.list_kernels.return_value = N(kernels=[], next_page_token='')
+    api.save_kernel.side_effect = failure
+    backend = Backend('owner', client=client(kernels=api))
+    backend.snapshot = Mock(side_effect=ValueError('malformed recheck response'))
+    (tmp_path/'src/nba_orderbook').mkdir(parents=True)
+    (tmp_path/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    with pytest.raises(OutcomeUnknown):
+        backend.submit({'id':'batch'}, tmp_path)
+    assert api.save_kernel.call_count == 1
+    assert backend.snapshot.call_count == 1
+
+
+def test_unexpected_write_response_recovers_same_instance_without_resubmit(tmp_path):
+    api = Mock()
+    api.list_kernels.return_value = N(kernels=[], next_page_token='')
+    api.save_kernel.return_value = None
+    backend = Backend('owner', client=client(kernels=api))
+    backend.snapshot = Mock(return_value={'batch_id':'batch', 'ref':'owner/nba-batch-batch', 'version':1, 'status':'RUNNING'})
+    (tmp_path/'src/nba_orderbook').mkdir(parents=True)
+    (tmp_path/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    assert backend.submit({'id':'batch'}, tmp_path)['status']=='RUNNING'
+    assert api.save_kernel.call_count==1

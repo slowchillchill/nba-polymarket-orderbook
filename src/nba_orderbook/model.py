@@ -31,6 +31,7 @@ class Game:
     started: bool = False
     time_changes: list[dict] = field(default_factory=list)
     teams: list = field(default_factory=list)
+    postponed_with_time: bool = False
 
     @property
     def window(self):
@@ -41,7 +42,14 @@ class Game:
         return dt(self.start) + timedelta(hours=6)
 
     def reschedule(self, start, status='', live=False):
-        if start and not self.started and dt(start) != dt(self.start):
+        changed=bool(start and not self.started and dt(start)!=dt(self.start))
+        if status.lower()!='postponed':
+            self.postponed_with_time=False
+        elif changed:
+            self.postponed_with_time=True
+        elif self.status.lower()!='postponed':
+            self.postponed_with_time=False
+        if changed:
             self.time_changes.append({'observed_at': iso(now()), 'old': self.start, 'new': iso(start)})
             self.start = iso(start)
         self.status = status
