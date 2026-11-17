@@ -682,3 +682,73 @@ async def test_reused_backend_removes_version_only_after_terminal_confirmation(t
     third=await scan(config,backend,API(),FakeTimers())
     assert third['batches']['old']['state']=='ended'
     assert backend.known_sessions==[{'ref':'qa/other-project','version':7}]
+
+async def test_real_backend_explicit_submission_rejection_recovers_same_reference_next_scan(tmp_path):
+    from types import SimpleNamespace as N
+    from nba_orderbook.kaggle import Backend,MARKER
+    from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelResponse
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    root=tmp_path/'package';(root/'src/nba_orderbook').mkdir(parents=True)
+    (root/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    g=game(iso(now()+timedelta(minutes=60)))
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict())],[]
+    class Kernels:
+        def __init__(self):self.requests=[];self.accepted=None
+        def list_kernels(self,request):
+            return N(kernels=[N(ref=self.accepted)] if self.accepted else [],next_page_token='')
+        def save_kernel(self,request):
+            self.requests.append(request)
+            if len(self.requests)==1:
+                response=ApiSaveKernelResponse();response.error='CPU batch capacity reached'
+                return response
+            self.accepted=request.slug
+            response=ApiSaveKernelResponse();response.version_number=1
+            return response
+        def get_kernel(self,request):
+            bid=self.accepted.split('nba-batch-',1)[1]
+            return N(metadata=N(current_version_number=1,enable_gpu=False,enable_tpu=False),blob=N(source=json.dumps({'cells':[{'source':MARKER+bid}]})))
+        def get_kernel_session_status(self,request):return N(status=N(name='RUNNING'))
+    kernels=Kernels();backend=Backend('qa',client=N(kernels=N(kernels_api_client=kernels)))
+    backend.inspect_dataset=lambda ref:None
+    config={'state_dir':str(tmp_path/'state'),'owner':'qa','_path':'unused','source_dir':str(root)}
+    first=await scan(config,backend,API(),FakeTimers())
+    bid=next(iter(first['batches']))
+    assert first['batches'][bid]['state']=='planned' and first['batches'][bid]['error']=='SubmissionRejected'
+    second=await scan(config,backend,API(),FakeTimers())
+    assert list(second['batches'])==[bid] and second['batches'][bid]['state']=='submitted'
+    assert len(kernels.requests)==2 and kernels.requests[0].slug==kernels.requests[1].slug
+
+async def test_real_backend_rejected_response_with_failed_absence_check_is_not_retried(tmp_path):
+    import requests
+    from types import SimpleNamespace as N
+    from nba_orderbook.kaggle import Backend
+    from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelResponse
+    from nba_orderbook.scheduler import scan
+    from nba_orderbook.model import now,iso
+    root=tmp_path/'package';(root/'src/nba_orderbook').mkdir(parents=True)
+    (root/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    g=game(iso(now()+timedelta(minutes=60)))
+    class API:
+        async def discover(self):return [Game.from_dict(g.to_dict())],[]
+    class Kernels:
+        writes=0;fail_list=False
+        def list_kernels(self,request):
+            if self.fail_list:raise requests.Timeout('cannot prove ref absent')
+            return N(kernels=[],next_page_token='')
+        def save_kernel(self,request):
+            self.writes+=1;self.fail_list=True
+            response=ApiSaveKernelResponse();response.error='CPU batch capacity reached'
+            return response
+        def get_kernel(self,request):raise requests.Timeout('remote status remains unknown')
+    kernels=Kernels();backend=Backend('qa',client=N(kernels=N(kernels_api_client=kernels)))
+    backend.inspect_dataset=lambda ref:None
+    config={'state_dir':str(tmp_path/'state'),'owner':'qa','_path':'unused','source_dir':str(root)}
+    first=await scan(config,backend,API(),FakeTimers())
+    bid=next(iter(first['batches']))
+    assert first['batches'][bid]['state']=='submission_unknown'
+    kernels.fail_list=False
+    second=await scan(config,backend,API(),FakeTimers())
+    assert list(second['batches'])==[bid] and second['batches'][bid]['state']=='submission_unknown'
+    assert kernels.writes==1

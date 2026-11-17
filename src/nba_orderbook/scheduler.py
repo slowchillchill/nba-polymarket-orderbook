@@ -9,7 +9,7 @@ import uuid
 from contextlib import contextmanager
 from .model import Game, dt, iso, now, group_games, peak_concurrency
 from .collector import write_json
-from .kaggle import SubmissionNotAttempted
+from .kaggle import SubmissionNotAttempted, SubmissionRejected
 
 ACTIVE={'QUEUED','RUNNING','CANCEL_REQUESTED'}
 TERMINAL={'COMPLETE','ERROR','CANCEL_ACKNOWLEDGED','CANCELLED'}
@@ -64,7 +64,7 @@ async def scan(config,backend,api,timers=None):
     store=Store(config['state_dir'])
     games,anomalies=await api.discover()
     with store.locked() as state:
-        retry_batches={bid:b for bid,b in state['batches'].items() if b['state']=='planned' and b.get('error')==SubmissionNotAttempted.__name__}
+        retry_batches={bid:b for bid,b in state['batches'].items() if b['state']=='planned' and b.get('error') in (SubmissionNotAttempted.__name__,SubmissionRejected.__name__)}
         state['anomalies']=anomalies
         ambiguous={str(a['game_id']) for a in anomalies if a.get('reason')=='multiple_moneylines'}
         unique={game.game_id for game in games}
@@ -113,7 +113,7 @@ async def scan(config,backend,api,timers=None):
                       and not state['games'][gid].get('ambiguous_market')]
             if not eligible:
                 continue
-            # 尚未尝试 SaveKernel，按本轮时间重新分组。原身份延续给首个合法组。
+            # 尚无已接受的远端实例，按本轮时间重新分组。原身份延续给首个合法组。
             first_group=group_games(eligible)[0]
             retained={g.game_id for g in first_group}
             for gid in members:
@@ -202,7 +202,7 @@ def submit_locked(batch,store,state,config,backend):
         result=backend.submit(batch,Path(config.get('source_dir',Path.cwd())))
         batch.update(result)
         batch['state']='submitted'
-    except SubmissionNotAttempted as e:
+    except (SubmissionNotAttempted,SubmissionRejected) as e:
         batch['state']='planned'
         batch['error']=type(e).__name__
     except Exception as e:

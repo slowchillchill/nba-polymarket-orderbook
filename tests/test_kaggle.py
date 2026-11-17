@@ -6,7 +6,7 @@ import json
 import pytest
 import requests
 
-from nba_orderbook.kaggle import Backend, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, SubmissionNotAttempted, notebook_source
+from nba_orderbook.kaggle import Backend, FINAL_FILES, UPLOAD_FILES, OutcomeUnknown, SubmissionNotAttempted, SubmissionRejected, notebook_source
 
 
 def http_error(code):
@@ -439,3 +439,84 @@ def test_unexpected_write_response_recovers_same_instance_without_resubmit(tmp_p
     (tmp_path/'requirements.txt').write_text('kagglesdk==0.1.38\n')
     assert backend.submit({'id':'batch'}, tmp_path)['status']=='RUNNING'
     assert api.save_kernel.call_count==1
+
+
+def rejected_submission(tmp_path):
+    from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelResponse
+    api = Mock()
+    rejected = ApiSaveKernelResponse()
+    rejected.error = 'temporary submission rejection'
+    assert rejected.version_number == 0
+    api.save_kernel.return_value = rejected
+    (tmp_path/'src/nba_orderbook').mkdir(parents=True)
+    (tmp_path/'requirements.txt').write_text('kagglesdk==0.1.38\n')
+    backend = Backend('owner', client=client(kernels=api))
+    backend.snapshot = Mock(return_value={'ref':'owner/nba-batch-batch', 'version':1,
+                                         'status':'RUNNING', 'batch_id':'batch'})
+    return backend, api, rejected
+
+
+def test_explicit_rejection_confirmed_absent_all_pages_can_retry_same_reference(tmp_path):
+    from kagglesdk.kernels.types.kernels_api_service import ApiSaveKernelResponse
+    backend, api, rejected = rejected_submission(tmp_path)
+    created = ApiSaveKernelResponse()
+    created.version_number = 1
+    api.save_kernel.side_effect = [rejected, created]
+    absent = N(kernels=[], next_page_token='')
+    api.list_kernels.side_effect = [absent,
+        N(kernels=[N(ref='owner/other')], next_page_token='second-page'), absent,
+        absent, N(kernels=[N(ref='owner/nba-batch-batch')], next_page_token='')]
+    with pytest.raises(SubmissionRejected):
+        backend.submit({'id':'batch'}, tmp_path)
+    assert api.save_kernel.call_count == 1
+    backend.snapshot.assert_not_called()
+    assert api.list_kernels.call_args_list[2].args[0].page_token == 'second-page'
+    assert backend.submit({'id':'batch'}, tmp_path)['version'] == 1
+    assert backend.submit({'id':'batch'}, tmp_path)['version'] == 1
+    assert api.save_kernel.call_count == 2  # 一次拒绝、一次创建；已存在的对象直接复用。
+    assert {call.args[0].slug for call in api.save_kernel.call_args_list} == {'owner/nba-batch-batch'}
+
+
+@pytest.mark.parametrize('failure', [requests.Timeout(), ValueError('malformed listing')])
+def test_rejection_with_failed_presence_check_remains_unknown(tmp_path, failure):
+    backend, api, _ = rejected_submission(tmp_path)
+    api.list_kernels.side_effect = [N(kernels=[], next_page_token=''), failure]
+    with pytest.raises(OutcomeUnknown):
+        backend.submit({'id':'batch'}, tmp_path)
+    assert api.save_kernel.call_count == 1
+    backend.snapshot.assert_not_called()
+
+
+def test_rejection_with_existing_instance_on_later_page_reuses_same_batch(tmp_path):
+    backend, api, _ = rejected_submission(tmp_path)
+    present = N(kernels=[N(ref='owner/nba-batch-batch')], next_page_token='')
+    api.list_kernels.side_effect = [N(kernels=[], next_page_token=''),
+        N(kernels=[N(ref='owner/other')], next_page_token='second-page'), present, present]
+    assert backend.submit({'id':'batch'}, tmp_path)['version'] == 1
+    assert backend.submit({'id':'batch'}, tmp_path)['version'] == 1
+    assert api.save_kernel.call_count == 1
+
+
+@pytest.mark.parametrize('snapshot', [requests.Timeout(), {'batch_id':'other'}])
+def test_rejection_with_existing_unconfirmed_instance_is_unknown(tmp_path, snapshot):
+    backend, api, _ = rejected_submission(tmp_path)
+    api.list_kernels.side_effect = [N(kernels=[], next_page_token=''),
+        N(kernels=[N(ref='owner/nba-batch-batch')], next_page_token='')]
+    if isinstance(snapshot, Exception):
+        backend.snapshot.side_effect = snapshot
+    else:
+        backend.snapshot.return_value = snapshot
+    with pytest.raises(OutcomeUnknown):
+        backend.submit({'id':'batch'}, tmp_path)
+    assert api.save_kernel.call_count == 1
+
+
+def test_error_with_positive_version_is_not_a_confirmed_rejection(tmp_path):
+    backend, api, response = rejected_submission(tmp_path)
+    response.version_number = 1
+    api.list_kernels.return_value = N(kernels=[], next_page_token='')
+    backend.snapshot.side_effect = http_error(403)
+    with pytest.raises(OutcomeUnknown):
+        backend.submit({'id':'batch'}, tmp_path)
+    assert api.save_kernel.call_count == 1
+    assert api.list_kernels.call_count == 1

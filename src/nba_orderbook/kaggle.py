@@ -36,6 +36,10 @@ class SubmissionNotAttempted(RuntimeError):
     """首次只读查询失败，尚未发送写请求；重试必须保留同一批次身份。"""
 
 
+class SubmissionRejected(RuntimeError):
+    """写请求被明确拒绝且回查确认未创建；重试必须保留同一批次身份。"""
+
+
 class OutcomeUnknown(RuntimeError):
     """远端写入结果尚未确认；调用者必须保留原实例或发布状态。"""
 
@@ -208,18 +212,31 @@ class Backend:
                            session_timeout_seconds=min(timeout_seconds, 3600) if qa else timeout_seconds)
         try:
             result = self.client.kernels.kernels_api_client.save_kernel(request)
-            if result.error or result.invalid_tags or result.invalid_dataset_sources or result.invalid_kernel_sources or result.invalid_competition_sources or result.invalid_model_sources:
-                raise RuntimeError('kernel_submission_rejected')
-            return {'ref': ref, 'version': result.version_number, 'status': 'QUEUED', 'batch_id': batch['id']}
+            # 官方 CLI 以 error 判断拒绝；invalid_* 本身不证明未创建。
+            rejected = bool(result.error) and result.version_number == 0
+            if not rejected:
+                if result.error or result.invalid_tags or result.invalid_dataset_sources or result.invalid_kernel_sources or result.invalid_competition_sources or result.invalid_model_sources:
+                    raise RuntimeError('kernel_submission_needs_reconciliation')
+                return {'ref': ref, 'version': result.version_number, 'status': 'QUEUED', 'batch_id': batch['id']}
         except Exception:
             # SaveKernel 一旦开始调用，异常不能证明未写入；只回查同一 ref。
-            try:
-                observed = self.snapshot(ref)
-                if observed['batch_id'] != batch['id']:
-                    raise OutcomeUnknown('kernel_submission_outcome_unknown')
-            except Exception:
-                raise OutcomeUnknown('kernel_submission_outcome_unknown') from None
-            return observed
+            return self._submitted_or_unknown(ref, batch['id'])
+        try:
+            exists = any(kernel.ref == ref for kernel in self._own_kernels())
+        except Exception:
+            raise OutcomeUnknown('rejected_kernel_presence_unknown') from None
+        if not exists:
+            raise SubmissionRejected('kernel_submission_rejected_without_creation')
+        return self._submitted_or_unknown(ref, batch['id'])
+
+    def _submitted_or_unknown(self, ref, batch_id):
+        try:
+            observed = self.snapshot(ref)
+            if observed['batch_id'] != batch_id:
+                raise OutcomeUnknown('kernel_submission_outcome_unknown')
+        except Exception:
+            raise OutcomeUnknown('kernel_submission_outcome_unknown') from None
+        return observed
 
     def list_active(self):
         """已观测占用：账号最新版本及显式登记版本；不是 CPU 配额证明。"""
