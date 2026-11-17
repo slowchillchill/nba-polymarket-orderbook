@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+[project]
+name = "nba-orderbook"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["httpx==0.28.1", "websockets==15.0.1", "kagglesdk==0.1.38"]
+[project.scripts]
+nba-orderbook = "nba_orderbook.cli:main"
+[dependency-groups]
+dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
